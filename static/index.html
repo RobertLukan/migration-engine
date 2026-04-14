@@ -1,0 +1,2207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Migration orchestrator</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7edf5;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --danger: #f47174;
+      --ok: #3ecf8e;
+    }
+    * { box-sizing: border-box; }
+    .hidden { display: none !important; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    h1 { font-size: 1.125rem; font-weight: 600; margin: 0; }
+    .brand {
+      color: inherit;
+      text-decoration: none;
+    }
+    .brand:hover { text-decoration: underline; }
+    main { max-width: 52rem; margin: 0 auto; padding: 1.5rem; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+    .card h2 { margin: 0 0 1rem; font-size: 1rem; font-weight: 600; }
+    .subhead {
+      margin: 1rem 0 0.5rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+      border-top: 1px solid var(--border);
+      padding-top: 0.75rem;
+    }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      margin-bottom: 0.75rem;
+    }
+    input[type="checkbox"] { width: auto; margin-right: 0.35rem; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      padding: 0.5rem 1rem;
+      font-weight: 500;
+      font-size: 0.875rem;
+    }
+    button.primary { background: var(--accent); color: #fff; }
+    button.secondary { background: var(--border); color: var(--text); }
+    button.danger { background: #4a2c2c; color: #ffb4b4; }
+    .banner {
+      padding: 0.65rem 1rem;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+      font-size: 0.875rem;
+      display: none;
+    }
+    .banner.show { display: block; }
+    .banner.ok { background: #1a3d2e; border: 1px solid #2d6a4a; color: #a8e6c1; }
+    .banner.err { background: #3d1f24; border: 1px solid #6a2d35; color: #ffc9c9; }
+    .banner.info { background: #1e2f4a; border: 1px solid #2d4a7a; color: #b8d4ff; }
+    #login-panel { max-width: 22rem; margin: 4rem auto; }
+    .hint { font-size: 0.8rem; color: var(--muted); margin-top: -0.35rem; margin-bottom: 0.75rem; }
+    .inline { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    nav.actions a.nav, nav.actions button.nav {
+      text-decoration: none;
+      font: inherit;
+      display: inline-block;
+    }
+    nav.actions a.nav.active, nav.actions button.nav.active {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    table.vm-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+    table.vm-table th, table.vm-table td {
+      text-align: left;
+      padding: 0.5rem 0.6rem;
+      border-bottom: 1px solid var(--border);
+    }
+    table.vm-table th { color: var(--muted); font-weight: 500; }
+    .empty-state { color: var(--muted); padding: 1rem 0; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    tr.vm-row { cursor: pointer; }
+    tr.vm-row:hover { background: rgba(61, 139, 253, 0.08); }
+    tr.vm-row.selected { background: rgba(61, 139, 253, 0.12); }
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .modal-backdrop.show { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      max-width: 26rem;
+      width: 100%;
+      padding: 1.25rem;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .modal h3 { margin: 0 0 1rem; font-size: 1rem; }
+    .modal .actions { margin-top: 1rem; }
+    .modal.wide { max-width: 48rem; }
+    .progress-wrap {
+      height: 6px;
+      background: var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      min-width: 5rem;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.35s ease;
+      background: var(--accent);
+    }
+    .progress-fill.done { background: var(--ok); }
+    .progress-fill.fail { background: var(--danger); }
+    .state-pill {
+      font-size: 0.75rem;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      background: var(--border);
+    }
+    .log-pre {
+      margin: 0;
+      padding: 0.75rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      max-height: 55vh;
+      overflow: auto;
+      font-size: 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .health-strip {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.65rem 1.25rem;
+      padding: 0.5rem 1.25rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      background: rgba(26, 35, 50, 0.92);
+    }
+    .health-strip.all-ok { border-bottom-color: rgba(62, 207, 142, 0.35); }
+    .health-strip.has-warn { border-bottom-color: rgba(230, 180, 80, 0.45); }
+    .health-strip.has-err { border-bottom-color: rgba(244, 113, 116, 0.45); }
+    .health-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .health-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--muted);
+    }
+    .health-dot.ok { background: var(--ok); }
+    .health-dot.warn { background: #e6b450; }
+    .health-dot.err { background: var(--danger); }
+    .health-title { font-weight: 600; color: var(--text); margin-right: 0.25rem; }
+    .job-tl-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem 0.35rem;
+      align-items: center;
+      margin: 0.65rem 0 0.5rem;
+    }
+    .job-tl-step {
+      font-size: 0.68rem;
+      padding: 0.2rem 0.45rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .job-tl-step.done {
+      border-color: rgba(62, 207, 142, 0.45);
+      color: var(--ok);
+    }
+    .job-tl-step.current {
+      border-color: rgba(61, 139, 253, 0.55);
+      color: var(--text);
+      font-weight: 600;
+    }
+    .job-tl-step.err {
+      border-color: rgba(244, 113, 116, 0.55);
+      color: var(--danger);
+      font-weight: 600;
+    }
+    .job-tl-step.cancelled {
+      border-color: rgba(230, 180, 80, 0.55);
+      color: #e6b450;
+    }
+    .job-tl-step.pending {
+      opacity: 0.45;
+    }
+    .job-detail-error {
+      color: var(--danger);
+      font-size: 0.82rem;
+      margin: 0.5rem 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .job-detail-meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin: 0 0 0.5rem;
+    }
+    #job-detail-log-pre {
+      max-height: 42vh;
+    }
+    table.vm-table th.job-col-select {
+      width: 2rem;
+      text-align: center;
+    }
+    table.vm-table td.job-col-select {
+      text-align: center;
+      vertical-align: middle;
+    }
+    .help-body {
+      max-height: calc(90vh - 8rem);
+      overflow-y: auto;
+      font-size: 0.88rem;
+      line-height: 1.5;
+      color: var(--text);
+      padding-right: 0.35rem;
+    }
+    .help-body h4 {
+      margin: 1.1rem 0 0.4rem;
+      font-size: 0.95rem;
+      color: var(--text);
+      scroll-margin-top: 0.75rem;
+    }
+    .help-body h4:first-child {
+      margin-top: 0;
+    }
+    .help-body ul {
+      margin: 0.35rem 0 0.65rem 1.15rem;
+      padding: 0;
+    }
+    .help-body li {
+      margin: 0.28rem 0;
+    }
+    .help-body p {
+      margin: 0.5rem 0;
+    }
+    .help-body code {
+      font-size: 0.84em;
+    }
+    .help-index-wrap {
+      margin: 0.45rem 0 0.65rem;
+    }
+    .help-index-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin: 0 0 0.35rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .help-index {
+      list-style: none;
+      margin: 0;
+      padding: 0.45rem 0.65rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.8rem;
+      columns: 2;
+      column-gap: 1.25rem;
+    }
+    @media (max-width: 520px) {
+      .help-index {
+        columns: 1;
+      }
+    }
+    .help-index li {
+      margin: 0.22rem 0;
+      break-inside: avoid;
+    }
+    .help-index a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .help-index a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div id="health-strip" class="health-strip hidden" aria-live="polite">
+    <span class="health-title">Services</span>
+    <span class="health-item"><span class="health-dot" id="health-dot-summary"></span><span id="health-summary">Checking…</span></span>
+  </div>
+  <div id="login-screen">
+    <header><h1><a class="brand" href="/">Migration orchestrator</a></h1></header>
+    <main>
+      <div class="card" id="login-panel">
+        <h2>Sign in</h2>
+        <p class="hint">Use the password from <code>ui.password</code> in <code>config.yaml</code>.</p>
+        <div id="login-banner" class="banner err"></div>
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" autocomplete="current-password" />
+        <div class="actions">
+          <button type="button" class="primary" id="btn-login">Sign in</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="app-screen" class="hidden">
+    <header>
+      <h1><a class="brand" href="#" id="brand-link">Migration orchestrator</a></h1>
+      <nav class="actions">
+        <button type="button" class="secondary nav" id="nav-home">Guests</button>
+        <button type="button" class="secondary nav" id="nav-jobs">Migrations</button>
+        <button type="button" class="secondary nav" id="nav-credentials">Settings</button>
+        <button type="button" class="secondary" id="btn-help" title="Overview and features">Help</button>
+        <button type="button" class="secondary" id="btn-logout">Sign out</button>
+      </nav>
+    </header>
+    <main>
+      <div id="global-banner" class="banner info"></div>
+
+      <div id="view-home" class="hidden">
+        <div class="card">
+          <h2>Guests available to migrate</h2>
+          <p class="hint" id="vm-list-intro">
+            Select guests with the checkboxes (or click a row), then <strong>Migrate selected</strong>. By default, names come from <strong>ESXi-linked storage</strong> on your Proxmox node. If you save VMware credentials and they verify, <strong>power</strong> and <strong>UUID</strong> are filled from vCenter for matching names.
+          </p>
+          <div class="actions" style="margin-bottom: 0.75rem;">
+            <button type="button" class="secondary" id="btn-refresh-vms">Refresh list</button>
+            <button type="button" class="secondary" id="btn-select-all-vms">Select all</button>
+            <button type="button" class="secondary" id="btn-clear-vm-selection">Clear selection</button>
+            <button type="button" class="primary" id="btn-open-migrate-modal" disabled>Migrate selected…</button>
+          </div>
+          <div id="vm-list-status" class="hint"></div>
+          <div style="overflow-x: auto;">
+            <table class="vm-table" id="vm-table" hidden>
+              <thead>
+                <tr>
+                  <th style="width:2.5rem;"><input type="checkbox" id="vm-select-all" title="Select all" /></th>
+                  <th>Name</th>
+                  <th>MoRef</th>
+                  <th>UUID</th>
+                  <th>Power</th>
+                </tr>
+              </thead>
+              <tbody id="vm-tbody"></tbody>
+            </table>
+          </div>
+          <p class="empty-state" id="vm-empty" hidden>No VMs returned.</p>
+          <p class="hint" style="margin-top:1rem;">
+            <a href="#" id="link-setup-again">Run connection setup again</a> (locks the guest list until Proxmox is re-verified; VMware is optional)
+          </p>
+        </div>
+      </div>
+
+      <div id="view-jobs" class="hidden">
+        <div class="card">
+          <h2>Migration progress</h2>
+          <p class="hint" id="jobs-poll-hint">
+            States update from Redis while the worker runs. The list refreshes about every <strong>5s</strong> while this
+            tab is visible, and about every <strong>20s</strong> when the browser tab is in the background.
+          </p>
+          <div class="actions" style="margin-bottom: 0.75rem;">
+            <button type="button" class="secondary" id="btn-refresh-jobs">Refresh now</button>
+            <button type="button" class="danger" id="btn-bulk-cancel-pending" disabled title="Select PENDING jobs below">
+              Cancel selected (PENDING)
+            </button>
+          </div>
+          <div id="jobs-list-status" class="hint"></div>
+          <div style="overflow-x: auto;">
+            <table class="vm-table" id="jobs-table" hidden>
+              <thead>
+                <tr>
+                  <th class="job-col-select" title="Select queued jobs to cancel">
+                    <input type="checkbox" id="jobs-select-all-pending" aria-label="Select all PENDING jobs" />
+                  </th>
+                  <th>VM name</th>
+                  <th>PVE ID</th>
+                  <th>Node</th>
+                  <th>State</th>
+                  <th>Progress</th>
+                  <th>Updated</th>
+                  <th>Notes</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-tbody"></tbody>
+            </table>
+          </div>
+          <p class="empty-state" id="jobs-empty" hidden>No migration jobs yet. Enqueue from the Guests tab.</p>
+        </div>
+      </div>
+
+      <div id="help-modal" class="modal-backdrop" aria-hidden="true">
+        <div class="modal wide" role="dialog" aria-labelledby="help-modal-title" aria-modal="true">
+          <h3 id="help-modal-title">Help — migration orchestrator</h3>
+          <p class="hint" id="help-version-line" style="margin-top: 0">Loading version…</p>
+          <nav class="help-index-wrap" aria-label="Help topics">
+            <div class="help-index-title">Index</div>
+            <ul class="help-index">
+              <li><a href="#help-overview">Overview</a></li>
+              <li><a href="#help-workflow">Workflow</a></li>
+              <li><a href="#help-features-ui">Dashboard &amp; UI</a></li>
+              <li><a href="#help-features-technical">API &amp; worker</a></li>
+              <li><a href="#help-horizon">Horizon / guest</a></li>
+              <li><a href="#help-roadmap">Roadmap</a></li>
+              <li><a href="#help-security">Security</a></li>
+              <li><a href="#help-architecture">Architecture</a></li>
+              <li><a href="#help-further-reading">Further reading</a></li>
+            </ul>
+          </nav>
+          <div class="help-body">
+            <h4 id="help-overview">Overview</h4>
+            <p>
+              This dashboard drives a <strong>VMware → Proxmox</strong> migration pipeline: you pick guests, enqueue
+              jobs, and a <strong>worker</strong> (separate process) performs import, disk layout, reboots, and guest
+              steps. It fits <strong>batch / VDI-style</strong> moves when combined with your own Horizon / Omnissa guest
+              scripts in configuration.
+            </p>
+
+            <h4 id="help-workflow">Typical workflow</h4>
+            <ol style="margin: 0.35rem 0 0.6rem 1.2rem; padding: 0">
+              <li>Complete <strong>Settings</strong> (Proxmox required; VMware optional for extra columns).</li>
+              <li>Open <strong>Guests</strong>, select VMs, then <strong>Migrate selected</strong> to enqueue jobs.</li>
+              <li>Use <strong>Migrations</strong> to watch progress, open <strong>Details</strong> (timeline + logs), stop or bulk-cancel queued jobs.</li>
+            </ol>
+
+            <h4 id="help-features-ui">Dashboard &amp; operator features</h4>
+            <ul>
+              <li><strong>Session UI</strong> — Password login; dashboard after credential verification gate.</li>
+              <li><strong>Guests</strong> — Inventory from Proxmox ESXi-linked storage; optional vCenter merge (MoRef, UUID, power) when VMware is configured.</li>
+              <li><strong>Migrate</strong> — Per-VM Proxmox VMID allocation, node, storage (dropdown + manual), RAM/CPU, optional QEMU CPU preset (nested/VBS), optional <strong>simulated import</strong> (clone template on PVE).</li>
+              <li><strong>Migrations</strong> — Redis-backed states; list with progress bar; <strong>Details</strong> (timeline, error, log tail with auto-refresh, copy diagnostics); <strong>Logs</strong> modal; <strong>Stop</strong>; <strong>bulk cancel</strong> for PENDING; polling slows when the browser tab is hidden.</li>
+              <li><strong>Settings</strong> — Load/save <code>config.yaml</code> sections with masked secrets; test Proxmox and VMware connections.</li>
+              <li><strong>Services strip</strong> — <code>GET /health</code>: config + Redis + Proxmox (required); VMware (optional, warning not red).</li>
+            </ul>
+
+            <h4 id="help-features-technical">API, worker, safety &amp; deployment</h4>
+            <ul>
+              <li><strong>Safety</strong> — Optional <code>proxmox.safety</code> envelope (VMID range, storage allowlist, scratch purge naming) enforced on enqueue/worker.</li>
+              <li><strong>Worker pipeline</strong> — Import / simulated clone, SATA boot path, guest agent, SCSI swap, configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
+              <li><strong>REST</strong> — Authenticated <code>/jobs</code>, <code>/vms</code>, <code>/migration-defaults</code>, etc.; public <code>/health</code> and <code>/version</code>.</li>
+              <li><strong>Deploy</strong> — Docker Compose stack documented (API + worker + optional Redis); nginx reverse-proxy notes.</li>
+            </ul>
+
+            <h4 id="help-horizon">Horizon / guest automation (today)</h4>
+            <p>
+              After the VM is on Proxmox, the worker runs your <strong>PowerShell</strong> over WinRM from
+              <code>horizon.powershell_script</code> in <code>config.yaml</code>. There is <strong>no</strong> built-in
+              Connection Server REST client yet (pool moves, re-register to manual pool, etc. are design notes under
+              <code>docs/</code>).
+            </p>
+
+            <h4 id="help-roadmap">Potential roadmap (ideas, not commitments)</h4>
+            <ul>
+              <li><strong>Resume / retry</strong> — Operator-triggered resume when only the Horizon / WinRM stage failed (idempotent scripts).</li>
+              <li><strong>Horizon Connection Server API</strong> — Optional integration for manual pool registration, entitlements, inventory sync.</li>
+              <li><strong>Preflight / dry-run</strong> — Validate enqueue inputs without starting destructive work.</li>
+              <li><strong>Job metadata</strong> — Pool / wave labels for reporting; richer audit trail.</li>
+              <li><strong>Live logs</strong> — SSE or WebSocket if log volume grows; split cheap vs deep health checks.</li>
+              <li><strong>Config validation</strong> — Stricter schema at startup; optional <code>https_only</code> cookies when always behind TLS.</li>
+            </ul>
+
+            <h4 id="help-security">Security considerations</h4>
+            <ul>
+              <li><strong>Exposure</strong> — Prefer private network or VPN; put the UI behind <strong>TLS</strong> (e.g. nginx). This tool drives Proxmox and guest automation; treat it as <strong>admin-tier</strong>.</li>
+              <li><strong>Secrets</strong> — <code>config.yaml</code> holds passwords and API tokens; restrict file permissions and backups. <strong>Redis</strong> holds job fields (including guest credentials used for WinRM); use ACLs, auth, and a dedicated DB index; protect Redis dumps.</li>
+              <li><strong>Sessions</strong> — Single shared dashboard password; session cookie flags depend on app settings — see <code>SessionMiddleware</code> in code. Consider login rate limiting at nginx for internet-facing installs.</li>
+              <li><strong>Public endpoints</strong> — <code>GET /health</code> and <code>GET /version</code> need no login; they can reveal coarse dependency status — restrict by network if that matters.</li>
+              <li><strong>Infrastructure accounts</strong> — Use <strong>least privilege</strong> Proxmox tokens and VMware roles; keep <code>proxmox.safety</code> aligned with what those accounts may touch.</li>
+              <li><strong>Guest scripts</strong> — <code>horizon.powershell_script</code> runs with supplied WinRM credentials; treat script changes like production code (review, no secrets in logs, idempotent where possible).</li>
+            </ul>
+
+            <h4 id="help-architecture">Where things run</h4>
+            <ul>
+              <li><strong>This web app</strong> — FastAPI UI + API (browser or reverse proxy).</li>
+              <li><strong>Worker</strong> — Consumes Redis queue; talks to Proxmox API and guests (WinRM).</li>
+              <li><strong>Redis</strong> — Job state, logs, queue (see deployment docs for host vs container Redis).</li>
+            </ul>
+
+            <h4 id="help-further-reading">Further reading</h4>
+            <p class="hint" style="margin-bottom: 0">
+              Repository files: <code>PRODUCT.md</code> (operator ideas), <code>DOCKER.md</code> / <code>NGINX.md</code>
+              (deploy), <code>docs/HORIZON_*.md</code> (Horizon resume / Connection Server notes). The version line above is
+              loaded from <code>GET /version</code> (optional <code>MIGRATION_ENGINE_GIT_REVISION</code> env for build id).
+            </p>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="btn-help-close">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="migrate-modal" class="modal-backdrop" aria-hidden="true">
+        <div class="modal" role="dialog" aria-labelledby="migrate-modal-title">
+          <h3 id="migrate-modal-title">Migrate to Proxmox</h3>
+          <p class="hint" id="migrate-modal-summary"></p>
+          <p class="hint" id="mig-vmdk-hint"></p>
+          <label for="mig-vmid-start">First Proxmox VM ID</label>
+          <input id="mig-vmid-start" type="number" min="100" step="1" />
+          <p class="hint" id="mig-vmid-hint">
+            Each selected VM gets the next free ID from this start. If the server defines a migration VMID range, the default and minimum follow that range.
+          </p>
+          <label for="mig-node">Proxmox node (optional)</label>
+          <input id="mig-node" placeholder="Uses default from config if empty" />
+          <label for="mig-storage-select">Proxmox storage (from node)</label>
+          <select id="mig-storage-select"></select>
+          <p class="hint" id="mig-storage-hint">Loads from the API. Prefer entries marked OK for VM disks (ZFS, RBD, …). Disabled rows are greyed out.</p>
+          <label for="mig-storage-manual">Or type a storage ID manually</label>
+          <input id="mig-storage-manual" placeholder="Used if dropdown is empty or listing failed" />
+          <label for="mig-vlan">VLAN tag for guest net0 (optional)</label>
+          <input id="mig-vlan" type="number" min="1" max="4094" placeholder="Leave empty for untagged" />
+          <label for="mig-ram">Memory (MB)</label>
+          <input id="mig-ram" type="number" min="512" step="256" />
+          <label for="mig-cores">CPUs (cores)</label>
+          <input id="mig-cores" type="number" min="1" max="256" step="1" />
+          <div class="inline" style="margin-top: 0.75rem">
+            <input type="checkbox" id="mig-enable-cpu-preset" />
+            <label for="mig-enable-cpu-preset" style="margin: 0">Enable custom CPU via QEMU <code>args</code></label>
+          </div>
+          <p class="hint" id="mig-cpu-preset-hint" style="margin-top: 0.25rem">
+            Off: keep imported/template CPU config as-is. On: replace <code>cpu=</code> with preset <code>args</code> (requires root-capable args helper in Proxmox).
+          </p>
+          <fieldset id="mig-cpu-preset-wrap" class="hidden" style="margin-top: 0.4rem; border: 0; padding: 0">
+            <legend style="font-size: 0.9rem; margin-bottom: 0.35rem">CPU preset</legend>
+            <label style="display: block; margin: 0.35rem 0 0 0">
+              <input type="radio" name="mig-cpu-preset" value="host_no_nested" checked />
+              Host CPU, nested virtualization disabled, VBS disabled
+            </label>
+            <label style="display: block; margin: 0.25rem 0 0 0">
+              <input type="radio" name="mig-cpu-preset" value="host_nested_vbs" />
+              Host CPU, nested virtualization enabled, VBS enabled
+            </label>
+          </fieldset>
+          <div class="inline" style="margin-top: 0.5rem">
+            <input type="checkbox" id="mig-simulated" />
+            <label for="mig-simulated" style="margin: 0">Simulated import (clone Proxmox template VM instead of VMware disk import)</label>
+          </div>
+          <div id="mig-sim-source-wrap" class="hidden">
+            <label for="mig-sim-source-vmid">Simulated source template VMID</label>
+            <input id="mig-sim-source-vmid" type="number" min="100" step="1" placeholder="e.g. 147" />
+          </div>
+          <p class="hint" id="mig-simulated-hint"></p>
+          <div class="actions">
+            <button type="button" class="primary" id="btn-migrate-confirm">Enqueue migration</button>
+            <button type="button" class="secondary" id="btn-migrate-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="log-modal" class="modal-backdrop" aria-hidden="true">
+        <div class="modal wide" role="dialog" aria-labelledby="log-modal-title">
+          <h3 id="log-modal-title">Job log</h3>
+          <p class="hint" id="log-modal-subtitle"></p>
+          <pre class="log-pre" id="log-modal-body"></pre>
+          <div class="actions">
+            <button type="button" class="secondary" id="btn-log-close">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="job-detail-modal" class="modal-backdrop" aria-hidden="true">
+        <div class="modal wide" role="dialog" aria-labelledby="job-detail-title">
+          <h3 id="job-detail-title">Migration job</h3>
+          <p class="hint" id="job-detail-subtitle"></p>
+          <p class="job-detail-meta" id="job-detail-meta"></p>
+          <div id="job-detail-timeline" class="job-tl-row" aria-label="State timeline"></div>
+          <div id="job-detail-error" class="job-detail-error hidden"></div>
+          <p class="hint" style="margin: 0.35rem 0 0.25rem">Log tail (auto-refreshes while this panel is open)</p>
+          <pre class="log-pre" id="job-detail-log-pre"></pre>
+          <div class="actions">
+            <button type="button" class="secondary" id="btn-job-detail-copy">Copy diagnostics</button>
+            <button type="button" class="secondary" id="btn-job-detail-refresh">Refresh now</button>
+            <button type="button" class="danger hidden" id="btn-job-detail-stop">Stop migration</button>
+            <button type="button" class="secondary" id="btn-job-detail-close">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-credentials">
+      <div class="card">
+        <h2>Connection setup</h2>
+        <p class="hint" id="credentials-intro">
+          <strong>Proxmox</strong> is required. <strong>VMware (vCenter)</strong> is optional — add it if you want power state and UUID on the guest list.
+        </p>
+        <div class="actions" style="margin-bottom: 1rem;">
+          <button type="button" class="primary" id="btn-continue-dashboard">Continue to guest list</button>
+        </div>
+        <p class="hint" id="continue-hint">Continue verifies <strong>saved</strong> settings in <code>config.yaml</code> (Save each section after edits). <strong>Proxmox must succeed</strong>; VMware is tested only if host, user, and password are all set.</p>
+      </div>
+
+      <div class="card">
+        <h2>VMware (vCenter) — optional</h2>
+        <p class="hint">Leave blank or incomplete to skip. When configured and working, the dashboard merges MoRef, UUID, and power state for guests that exist both on ESXi storage (PVE) and in vCenter.</p>
+        <div class="row">
+          <div>
+            <label for="vmw-host">Host</label>
+            <input id="vmw-host" autocomplete="off" />
+          </div>
+          <div>
+            <label for="vmw-port">Port</label>
+            <input id="vmw-port" type="number" />
+          </div>
+        </div>
+        <label for="vmw-user">User</label>
+        <input id="vmw-user" autocomplete="username" />
+        <label for="vmw-password">Password</label>
+        <input id="vmw-password" type="password" autocomplete="new-password" placeholder="Leave unchanged if set" />
+        <p class="hint" id="vmw-pw-hint"></p>
+        <div class="inline">
+          <input type="checkbox" id="vmw-insecure" />
+          <label for="vmw-insecure" style="margin:0">Disable TLS verification (insecure)</label>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="btn-save-vmw">Save VMware</button>
+          <button type="button" class="secondary" id="btn-test-vmw">Test connection</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Proxmox</h2>
+        <div class="row">
+          <div>
+            <label for="px-host">Host</label>
+            <input id="px-host" />
+          </div>
+          <div>
+            <label for="px-port">API port</label>
+            <input id="px-port" type="number" />
+          </div>
+        </div>
+        <div class="inline">
+          <input type="checkbox" id="px-verify" />
+          <label for="px-verify" style="margin:0">Verify TLS</label>
+        </div>
+        <label for="px-node">Default node</label>
+        <input id="px-node" />
+        <label for="px-token-id">API token id (optional; quoted in YAML, e.g. &quot;root@pam!name&quot;)</label>
+        <input id="px-token-id" autocomplete="off" />
+        <label for="px-token-secret">API token secret</label>
+        <input id="px-token-secret" type="password" autocomplete="new-password" />
+        <p class="hint" id="px-tok-hint"></p>
+        <label for="px-user">User (password login, optional)</label>
+        <input id="px-user" autocomplete="off" />
+        <label for="px-password">Password (password login)</label>
+        <input id="px-password" type="password" autocomplete="new-password" />
+        <p class="hint" id="px-pw-hint"></p>
+        <div class="row">
+          <div>
+            <label for="px-storage">Storage</label>
+            <input id="px-storage" />
+          </div>
+          <div>
+            <label for="px-bridge-select">Linux bridge (vmbr*)</label>
+            <select id="px-bridge-select" aria-describedby="px-bridge-hint"></select>
+            <input id="px-bridge-other" class="hidden" type="text" placeholder="e.g. vmbr2" autocomplete="off" />
+            <p class="hint" id="px-bridge-hint">Loaded from the node above. Choose “Other…” to type a bridge name.</p>
+          </div>
+        </div>
+        <div class="actions" style="margin-bottom: 0.75rem">
+          <button type="button" class="secondary" id="btn-refresh-bridges">Refresh bridge list</button>
+        </div>
+        <h3 class="subhead">Guest network (first boot)</h3>
+        <label for="px-vlan">Access VLAN (optional)</label>
+        <input id="px-vlan" type="number" min="1" max="4094" placeholder="e.g. 100 — leave empty for untagged" />
+        <p class="hint">802.1Q VLAN tag applied to virtio <code>net0</code> on the selected bridge (Proxmox <code>tag=</code>).</p>
+        <div class="row">
+          <div>
+            <label for="px-net-mtu">MTU (virtio net0)</label>
+            <input id="px-net-mtu" type="number" min="576" max="9000" value="1500" />
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="btn-save-px">Save Proxmox</button>
+          <button type="button" class="secondary" id="btn-test-px">Test connection</button>
+        </div>
+      </div>
+
+      <p class="hint">
+        REST API (jobs, vms) uses the same session cookie after sign-in. <code>GET /health</code> and
+        <code>GET /version</code> stay public.
+      </p>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const MASK = "********";
+    let credentialsVerified = false;
+
+    function show(el, on) {
+      el.classList.toggle("hidden", !on);
+    }
+
+    function banner(el, type, text) {
+      el.textContent = text;
+      el.className = "banner show " + (type || "info");
+      if (!text) el.classList.remove("show");
+    }
+
+    function formatDetail(detail) {
+      if (!detail) return "";
+      if (typeof detail === "string") return detail;
+      if (Array.isArray(detail))
+        return detail.map((x) => (typeof x === "object" ? x.msg || JSON.stringify(x) : String(x))).join("; ");
+      return String(detail);
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s == null ? "" : String(s);
+      return d.innerHTML;
+    }
+
+    function escapeAttr(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;");
+    }
+
+    const HEALTH_POLL_MS = 30000;
+    const HEALTH_LABELS = {
+      config: "Config",
+      redis: "Redis",
+      proxmox: "Proxmox",
+      vmware: "VMware",
+    };
+
+    function truncateHealthText(s, maxLen) {
+      const t = s == null ? "" : String(s);
+      if (t.length <= maxLen) return t;
+      return t.slice(0, Math.max(0, maxLen - 1)) + "…";
+    }
+
+    function renderHealthStrip(data) {
+      const strip = document.getElementById("health-strip");
+      if (!strip) return;
+      strip.classList.remove("all-ok", "has-warn", "has-err");
+      if (!data || typeof data !== "object") {
+        strip.classList.add("has-err");
+        strip.innerHTML =
+          '<span class="health-title">Services</span>' +
+          '<span class="health-item"><span class="health-dot err"></span><span>Unable to read health response</span></span>';
+        return;
+      }
+      const allOk = data.status === "ok";
+      const comps =
+        data.components && typeof data.components === "object" ? data.components : {};
+      const order = ["config", "redis", "proxmox", "vmware"];
+      const keys = Object.keys(comps).sort((a, b) => {
+        const ia = order.indexOf(a);
+        const ib = order.indexOf(b);
+        if (ia === -1 && ib === -1) return a.localeCompare(b);
+        if (ia === -1) return 1;
+        if (ib === -1) return -1;
+        return ia - ib;
+      });
+      let optionalBad = false;
+      const bits = ['<span class="health-title">Services</span>'];
+      for (const name of keys) {
+        const c = comps[name];
+        const good = c && c.ok === true;
+        const optional = !!(c && c.optional);
+        if (optional && !good) optionalBad = true;
+        const detail = truncateHealthText(formatDetail(c && c.detail), 140);
+        const label = HEALTH_LABELS[name] || name.charAt(0).toUpperCase() + name.slice(1);
+        let dotClass = "ok";
+        if (!good) dotClass = optional ? "warn" : "err";
+        bits.push(
+          '<span class="health-item">' +
+            '<span class="health-dot ' +
+            dotClass +
+            '"></span><span><strong>' +
+            escapeHtml(label) +
+            "</strong> — " +
+            (good ? escapeHtml(detail || "ok") : escapeHtml(detail || "error")) +
+            "</span></span>"
+        );
+      }
+      strip.innerHTML = bits.join("");
+      if (!allOk) strip.classList.add("has-err");
+      else if (optionalBad) strip.classList.add("has-warn");
+      else strip.classList.add("all-ok");
+    }
+
+    async function refreshHealthStrip() {
+      const strip = document.getElementById("health-strip");
+      if (!strip || strip.classList.contains("hidden")) return;
+      try {
+        const r = await fetch("/health", {
+          method: "GET",
+          credentials: "omit",
+          headers: { Accept: "application/json" },
+        });
+        const data = await r.json().catch(() => null);
+        if (data && typeof data === "object") {
+          renderHealthStrip(data);
+          return;
+        }
+        renderHealthStrip({
+          status: "degraded",
+          components: {
+            health: {
+              ok: false,
+              detail: r.statusText || "Invalid health response (" + r.status + ")",
+            },
+          },
+        });
+      } catch (e) {
+        renderHealthStrip({
+          status: "degraded",
+          components: { network: { ok: false, detail: e.message || String(e) } },
+        });
+      }
+    }
+
+    async function api(path, opts) {
+      const r = await fetch(path, {
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...(opts && opts.headers) },
+        ...opts,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(formatDetail(data.detail) || r.statusText || String(r.status));
+      return data;
+    }
+
+    let lastMigrationDefaults = null;
+    let lastVmdkHintText = "";
+
+    function applyMigrateSimulatedToggle() {
+      const simCb = document.getElementById("mig-simulated");
+      const vmdkHint = document.getElementById("mig-vmdk-hint");
+      const hSim = document.getElementById("mig-simulated-hint");
+      const srcWrap = document.getElementById("mig-sim-source-wrap");
+      const srcInput = document.getElementById("mig-sim-source-vmid");
+      if (!simCb || !vmdkHint || !hSim || !srcWrap || !srcInput) return;
+      const vmid = lastMigrationDefaults ? lastMigrationDefaults.simulated_clone_source_vmid : 147;
+      if (simCb.checked) {
+        srcWrap.classList.remove("hidden");
+        if (!srcInput.value.trim()) srcInput.value = String(vmid);
+        vmdkHint.textContent =
+          "Simulated: VMware supplies guest names only. Proxmox clones template VM " +
+          srcInput.value.trim() +
+          ". No import-from.";
+        hSim.textContent =
+          "After clone, the worker moves the template OS disk from scsi0 to sata0, then runs the same SATA boot, driver check, and SATA→SCSI swap steps as a real import.";
+      } else {
+        srcWrap.classList.add("hidden");
+        vmdkHint.textContent = lastVmdkHintText || vmdkHint.textContent;
+        hSim.textContent = "";
+      }
+    }
+
+    function syncMigrateCpuPresetUi() {
+      const cb = document.getElementById("mig-enable-cpu-preset");
+      const wrap = document.getElementById("mig-cpu-preset-wrap");
+      if (!cb || !wrap) return;
+      wrap.classList.toggle("hidden", !cb.checked);
+    }
+
+    const MIGRATION_STATES = [
+      "PENDING",
+      "IMPORTING",
+      "SATA_BOOT",
+      "DRIVER_CHECK",
+      "SCSI_SWAP",
+      "HORIZON_CONFIG",
+      "COMPLETED",
+    ];
+    const JOBS_POLL_VISIBLE_MS = 5000;
+    const JOBS_POLL_HIDDEN_MS = 20000;
+    const JOB_TIMELINE_SEQ = MIGRATION_STATES;
+    let jobsPollTimer = null;
+    const pendingJobSelection = new Set();
+    let jobDetailJobId = null;
+    let jobDetailPollTimer = null;
+    let jobDetailLastRecord = null;
+
+    function stopJobsPoll() {
+      if (jobsPollTimer) {
+        clearTimeout(jobsPollTimer);
+        jobsPollTimer = null;
+      }
+    }
+
+    function scheduleJobsPoll() {
+      stopJobsPoll();
+      const ms = document.hidden ? JOBS_POLL_HIDDEN_MS : JOBS_POLL_VISIBLE_MS;
+      jobsPollTimer = setTimeout(async () => {
+        jobsPollTimer = null;
+        const vj = document.getElementById("view-jobs");
+        if (!vj || vj.classList.contains("hidden")) return;
+        await loadJobsList();
+        scheduleJobsPoll();
+      }, ms);
+    }
+
+    function startJobsPoll() {
+      scheduleJobsPoll();
+    }
+
+    function syncBulkCancelButton() {
+      const btn = document.getElementById("btn-bulk-cancel-pending");
+      if (btn) btn.disabled = pendingJobSelection.size === 0;
+    }
+
+    function syncJobsSelectAllCheckbox() {
+      const head = document.getElementById("jobs-select-all-pending");
+      if (!head) return;
+      const boxes = document.querySelectorAll("#jobs-tbody input.job-pick:not(:disabled)");
+      if (!boxes.length) {
+        head.checked = false;
+        head.indeterminate = false;
+        return;
+      }
+      const n = [...boxes].filter((b) => b.checked).length;
+      head.checked = n === boxes.length && n > 0;
+      head.indeterminate = n > 0 && n < boxes.length;
+    }
+
+    function migrationProgress(state) {
+      if (!state) return { pct: 0, cls: "" };
+      if (state === "FAILED" || state === "CANCELLED") return { pct: 100, cls: "fail" };
+      const i = MIGRATION_STATES.indexOf(state);
+      if (i < 0) return { pct: 5, cls: "" };
+      const denom = MIGRATION_STATES.length - 1;
+      return { pct: Math.round((i / denom) * 100), cls: state === "COMPLETED" ? "done" : "" };
+    }
+
+    function setNavActive(which) {
+      document.getElementById("nav-home").classList.toggle("active", which === "home");
+      document.getElementById("nav-jobs").classList.toggle("active", which === "jobs");
+      document.getElementById("nav-credentials").classList.toggle("active", which === "credentials");
+    }
+
+    function showAppView(which) {
+      const vh = document.getElementById("view-home");
+      const vj = document.getElementById("view-jobs");
+      const vc = document.getElementById("view-credentials");
+      stopJobsPoll();
+      if (which !== "jobs") closeJobDetailPanel();
+      show(vh, which === "home");
+      show(vj, which === "jobs");
+      show(vc, which === "credentials");
+      setNavActive(which);
+      if (which === "jobs") {
+        loadJobsList();
+        startJobsPoll();
+      }
+    }
+
+    function setLogModal(open) {
+      const el = document.getElementById("log-modal");
+      el.classList.toggle("show", open);
+      el.setAttribute("aria-hidden", open ? "false" : "true");
+    }
+
+    async function refreshHelpVersion() {
+      const el = document.getElementById("help-version-line");
+      if (!el) return;
+      el.textContent = "Loading version…";
+      try {
+        const r = await fetch("/version", {
+          credentials: "omit",
+          headers: { Accept: "application/json" },
+        });
+        const d = await r.json().catch(() => ({}));
+        let s = "";
+        if (d.version) s = "Version " + d.version;
+        if (d.name) s = (s ? s + " · " : "") + d.name;
+        if (d.revision) s += " · build " + d.revision;
+        el.textContent = s || "Version information unavailable.";
+      } catch (e) {
+        el.textContent = "Version (could not load: " + (e.message || "?") + ")";
+      }
+    }
+
+    function setHelpModal(open) {
+      const el = document.getElementById("help-modal");
+      if (!el) return;
+      el.classList.toggle("show", open);
+      el.setAttribute("aria-hidden", open ? "false" : "true");
+      if (open) refreshHelpVersion();
+    }
+
+    async function requestStopJob(jobId, skipConfirm) {
+      const gb = document.getElementById("global-banner");
+      if (!jobId) return;
+      if (
+        !skipConfirm &&
+        !confirm("Stop this migration? The worker will cancel as soon as it can (running Proxmox tasks may still finish).")
+      )
+        return;
+      try {
+        await api("/jobs/" + encodeURIComponent(jobId) + "/stop", { method: "POST" });
+        if (!skipConfirm) banner(gb, "ok", "Stop requested.");
+        await loadJobsList();
+        if (jobDetailJobId === jobId) await refreshJobDetailPanel();
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    }
+
+    function formatJobLogLines(lines) {
+      const parts = [];
+      for (const row of lines) {
+        if (row.raw) {
+          parts.push(row.raw);
+        } else if (row.ts && row.message) {
+          parts.push(row.ts + " [" + (row.level || "") + "] " + (row.stage || "") + ": " + row.message);
+        } else {
+          parts.push(JSON.stringify(row));
+        }
+      }
+      return parts.join("\n");
+    }
+
+    function jobDiagnosticsText(j) {
+      if (!j) return "";
+      const err = (j.error || "").trim();
+      return [
+        "job_id: " + j.job_id,
+        "vm_name: " + j.vm_name,
+        "proxmox_node: " + (j.proxmox_node || ""),
+        "proxmox_vmid: " + j.proxmox_vmid,
+        "state: " + (j.state || ""),
+        "last_failed_stage: " + (j.last_failed_stage || ""),
+        "guest_ip: " + (j.guest_ip || ""),
+        "updated_at: " + (j.updated_at || ""),
+        "simulated_import: " + (j.simulated_import === true ? "true" : j.simulated_import === false ? "false" : ""),
+        err ? "error:\n" + err : "error:",
+      ].join("\n");
+    }
+
+    function normalizedFailedStage(raw) {
+      if (!raw) return "";
+      const s = String(raw).trim();
+      if (!s) return "";
+      return s.split(":")[0].trim();
+    }
+
+    function renderJobTimeline(state, lastFailed) {
+      const seq = JOB_TIMELINE_SEQ;
+      const failBase = normalizedFailedStage(lastFailed);
+      const failIdx = failBase ? seq.indexOf(failBase) : -1;
+      const curIdx = state ? seq.indexOf(state) : -1;
+      const parts = [];
+
+      for (let i = 0; i < seq.length; i++) {
+        const name = seq[i];
+        let cls = "job-tl-step pending";
+        if (state === "COMPLETED") cls = "job-tl-step done";
+        else if (state === "FAILED") {
+          if (failIdx >= 0) {
+            if (i < failIdx) cls = "job-tl-step done";
+            else if (i === failIdx) cls = "job-tl-step err";
+          }
+        } else if (state === "CANCELLED") {
+          if (i === 0) cls = "job-tl-step cancelled";
+        } else if (curIdx >= 0) {
+          if (i < curIdx) cls = "job-tl-step done";
+          else if (i === curIdx) cls = "job-tl-step current";
+        }
+        parts.push('<span class="' + cls + '">' + escapeHtml(name) + "</span>");
+      }
+      if (state === "CANCELLED") {
+        parts.push('<span class="job-tl-step cancelled">' + escapeHtml("CANCELLED") + "</span>");
+      }
+      if (state === "FAILED" && failIdx < 0 && failBase) {
+        parts.push(
+          '<span class="job-tl-step err" title="' +
+            escapeAttr(String(lastFailed || "")) +
+            '">' +
+            escapeHtml(failBase) +
+            "</span>"
+        );
+      }
+      return parts.join("");
+    }
+
+    function setJobDetailModal(open) {
+      const el = document.getElementById("job-detail-modal");
+      el.classList.toggle("show", open);
+      el.setAttribute("aria-hidden", open ? "false" : "true");
+    }
+
+    function stopJobDetailPoll() {
+      if (jobDetailPollTimer) {
+        clearInterval(jobDetailPollTimer);
+        jobDetailPollTimer = null;
+      }
+    }
+
+    function closeJobDetailPanel() {
+      stopJobDetailPoll();
+      jobDetailJobId = null;
+      jobDetailLastRecord = null;
+      setJobDetailModal(false);
+    }
+
+    async function refreshJobDetailPanel() {
+      if (!jobDetailJobId) return;
+      const gb = document.getElementById("global-banner");
+      const errEl = document.getElementById("job-detail-error");
+      const logPre = document.getElementById("job-detail-log-pre");
+      const stopBtn = document.getElementById("btn-job-detail-stop");
+      try {
+        const j = await api("/jobs/" + encodeURIComponent(jobDetailJobId));
+        jobDetailLastRecord = j;
+        document.getElementById("job-detail-title").textContent = j.vm_name || "Migration job";
+        document.getElementById("job-detail-subtitle").textContent = "Job " + j.job_id;
+        document.getElementById("job-detail-meta").textContent =
+          "PVE VMID " +
+          String(j.proxmox_vmid) +
+          " · node " +
+          (j.proxmox_node || "—") +
+          " · state " +
+          (j.state || "—") +
+          (j.updated_at ? " · updated " + String(j.updated_at).replace("T", " ").slice(0, 19) : "");
+        document.getElementById("job-detail-timeline").innerHTML = renderJobTimeline(j.state, j.last_failed_stage);
+        const err = (j.error || "").trim();
+        if (err) {
+          errEl.textContent = err;
+          errEl.classList.remove("hidden");
+        } else {
+          errEl.textContent = "";
+          errEl.classList.add("hidden");
+        }
+        const terminal = ["COMPLETED", "FAILED", "CANCELLED"].indexOf(j.state) >= 0;
+        stopBtn.classList.toggle("hidden", terminal);
+        const lines = await api("/jobs/" + encodeURIComponent(jobDetailJobId) + "/log?limit=200");
+        logPre.textContent = formatJobLogLines(lines);
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    }
+
+    async function openJobDetailPanel(jobId) {
+      const gb = document.getElementById("global-banner");
+      if (!jobId) return;
+      jobDetailJobId = jobId;
+      setJobDetailModal(true);
+      stopJobDetailPoll();
+      try {
+        await refreshJobDetailPanel();
+        jobDetailPollTimer = setInterval(refreshJobDetailPanel, 4000);
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    }
+
+    async function copyJobDiagnostics() {
+      const gb = document.getElementById("global-banner");
+      const text = jobDiagnosticsText(jobDetailLastRecord);
+      if (!text) {
+        banner(gb, "info", "Nothing to copy yet — refresh the panel.");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        banner(gb, "ok", "Diagnostics copied to clipboard.");
+      } catch (_) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          banner(gb, "ok", "Diagnostics copied to clipboard.");
+        } catch (e2) {
+          banner(gb, "err", e2.message || String(e2));
+        }
+        document.body.removeChild(ta);
+      }
+    }
+
+    async function bulkCancelPendingJobs() {
+      const gb = document.getElementById("global-banner");
+      const ids = [...pendingJobSelection];
+      if (!ids.length) return;
+      if (!confirm("Cancel " + ids.length + " queued PENDING job(s)? They will be removed from the queue.")) return;
+      let ok = 0;
+      let fail = 0;
+      for (const id of ids) {
+        try {
+          await api("/jobs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
+          ok++;
+        } catch (_) {
+          fail++;
+        }
+      }
+      pendingJobSelection.clear();
+      syncBulkCancelButton();
+      await loadJobsList();
+      if (fail)
+        banner(gb, fail === ids.length ? "err" : "info", "Cancelled " + ok + ", failed " + fail + ".");
+      else banner(gb, "ok", "Cancelled " + ok + " job(s).");
+    }
+
+    async function loadJobsList() {
+      const statusEl = document.getElementById("jobs-list-status");
+      const tbody = document.getElementById("jobs-tbody");
+      const table = document.getElementById("jobs-table");
+      const empty = document.getElementById("jobs-empty");
+      statusEl.textContent = "Loading…";
+      try {
+        const jobs = await api("/jobs");
+        jobs.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+        const pollNote = document.hidden ? " (background refresh ~20s)" : " (visible ~5s)";
+        statusEl.textContent =
+          jobs.length + " job(s) · last refresh " + new Date().toLocaleTimeString() + pollNote;
+        if (!jobs.length) {
+          table.hidden = true;
+          empty.hidden = false;
+          tbody.innerHTML = "";
+          pendingJobSelection.clear();
+          syncBulkCancelButton();
+          syncJobsSelectAllCheckbox();
+          return;
+        }
+        empty.hidden = true;
+        table.hidden = false;
+        tbody.innerHTML = "";
+        const nextSel = new Set();
+        for (const j of jobs) {
+          if (j.state === "PENDING" && pendingJobSelection.has(j.job_id)) nextSel.add(j.job_id);
+        }
+        pendingJobSelection.clear();
+        nextSel.forEach((id) => pendingJobSelection.add(id));
+
+        for (const j of jobs) {
+          const pr = migrationProgress(j.state);
+          const err = (j.error || "").trim();
+          const simTag = j.simulated_import ? "[Simulated] " : "";
+          const note =
+            simTag +
+            (err || (j.guest_ip ? "IP: " + j.guest_ip : "") || (j.last_failed_stage || "") || "—");
+          const terminal = ["COMPLETED", "FAILED", "CANCELLED"].indexOf(j.state) >= 0;
+          const stopTitle = terminal ? "Migration finished — stop is not available" : "Stop this migration";
+          const isPending = j.state === "PENDING";
+          const picked = pendingJobSelection.has(j.job_id);
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            '<td class="job-col-select"><input type="checkbox" class="job-pick" data-job-id="' +
+            escapeAttr(j.job_id) +
+            '"' +
+            (isPending ? "" : " disabled") +
+            (picked && isPending ? " checked" : "") +
+            ' aria-label="Select job ' +
+            escapeAttr(j.job_id) +
+            '" /></td><td>' +
+            escapeHtml(j.vm_name) +
+            "</td><td>" +
+            escapeHtml(String(j.proxmox_vmid)) +
+            "</td><td>" +
+            escapeHtml(j.proxmox_node || "") +
+            '</td><td><span class="state-pill">' +
+            escapeHtml(j.state || "") +
+            "</span></td><td>" +
+            '<div class="progress-wrap" title="' +
+            pr.pct +
+            '%"><div class="progress-fill ' +
+            pr.cls +
+            '" style="width:' +
+            pr.pct +
+            '%"></div></div></td><td>' +
+            escapeHtml((j.updated_at || "").replace("T", " ").slice(0, 19)) +
+            '</td><td style="max-width:12rem;overflow:hidden;text-overflow:ellipsis" title="' +
+            escapeAttr(note) +
+            '">' +
+            escapeHtml(note.length > 80 ? note.slice(0, 77) + "…" : note) +
+            '</td><td style="white-space:nowrap"><button type="button" class="secondary btn-job-detail" data-job-id="' +
+            escapeHtml(j.job_id) +
+            '">Details</button> <button type="button" class="secondary btn-job-log" data-job-id="' +
+            escapeHtml(j.job_id) +
+            '">Logs</button> <button type="button" class="danger btn-job-stop" data-job-id="' +
+            escapeHtml(j.job_id) +
+            '"' +
+            (terminal ? " disabled" : "") +
+            ' title="' +
+            escapeAttr(stopTitle) +
+            '">Stop</button></td>';
+          tbody.appendChild(tr);
+        }
+        tbody.querySelectorAll(".job-pick").forEach((cb) => {
+          cb.onchange = () => {
+            const id = cb.getAttribute("data-job-id");
+            if (cb.checked) pendingJobSelection.add(id);
+            else pendingJobSelection.delete(id);
+            syncBulkCancelButton();
+            syncJobsSelectAllCheckbox();
+          };
+        });
+        tbody.querySelectorAll(".btn-job-detail").forEach((btn) => {
+          btn.onclick = () => openJobDetailPanel(btn.getAttribute("data-job-id"));
+        });
+        tbody.querySelectorAll(".btn-job-log").forEach((btn) => {
+          btn.onclick = () => openJobLog(btn.getAttribute("data-job-id"));
+        });
+        tbody.querySelectorAll(".btn-job-stop").forEach((btn) => {
+          btn.onclick = () => requestStopJob(btn.getAttribute("data-job-id"), false);
+        });
+        syncBulkCancelButton();
+        syncJobsSelectAllCheckbox();
+        if (jobDetailJobId) await refreshJobDetailPanel();
+      } catch (e) {
+        statusEl.textContent = "";
+        banner(document.getElementById("global-banner"), "err", e.message || String(e));
+      }
+    }
+
+    async function openJobLog(jobId) {
+      const gb = document.getElementById("global-banner");
+      try {
+        const lines = await api("/jobs/" + encodeURIComponent(jobId) + "/log?limit=300");
+        document.getElementById("log-modal-subtitle").textContent = "Job " + jobId;
+        document.getElementById("log-modal-body").textContent = formatJobLogLines(lines);
+        setLogModal(true);
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    }
+
+    function goVmwareHome() {
+      const gb = document.getElementById("global-banner");
+      if (!credentialsVerified) {
+        showAppView("credentials");
+        banner(gb, "info", "Finish connection setup below, then click “Continue to guest list” (Proxmox is required).");
+        return;
+      }
+      showAppView("home");
+      loadVmList();
+    }
+
+    function syncVmRow(tr) {
+      const cb = tr.querySelector('input[type="checkbox"]');
+      tr.classList.toggle("selected", cb && cb.checked);
+      updateMigrateButtonState();
+      syncVmSelectAllCheckbox();
+    }
+
+    function syncVmSelectAllCheckbox() {
+      const all = document.getElementById("vm-select-all");
+      const boxes = document.querySelectorAll("#vm-tbody input[type=checkbox]");
+      if (!boxes.length) {
+        all.checked = false;
+        all.indeterminate = false;
+        return;
+      }
+      const n = [...boxes].filter((b) => b.checked).length;
+      all.checked = n === boxes.length;
+      all.indeterminate = n > 0 && n < boxes.length;
+    }
+
+    function updateMigrateButtonState() {
+      const n = document.querySelectorAll("#vm-tbody input[type=checkbox]:checked").length;
+      document.getElementById("btn-open-migrate-modal").disabled = n === 0;
+    }
+
+    function getSelectedVmNames() {
+      return [...document.querySelectorAll("#vm-tbody tr")].filter((tr) => tr.querySelector("input:checked")).map((tr) => tr.dataset.vmName);
+    }
+
+    async function loadVmList() {
+      const statusEl = document.getElementById("vm-list-status");
+      const tbody = document.getElementById("vm-tbody");
+      const table = document.getElementById("vm-table");
+      const empty = document.getElementById("vm-empty");
+      const selAll = document.getElementById("vm-select-all");
+      selAll.checked = false;
+      selAll.indeterminate = false;
+      statusEl.textContent = "Loading…";
+      tbody.innerHTML = "";
+      empty.textContent = "No VMs returned.";
+      try {
+        const vms = await api("/vms");
+        window.vmInventory = vms;
+        const enriched = vms.some((v) => v.vmware_moref && String(v.vmware_moref).trim());
+        statusEl.textContent =
+          (vms.length ? vms.length + " guest(s)" : "0 guests") +
+          (enriched ? " · vCenter details merged where names match" : " · from Proxmox ESXi storage only");
+        if (!vms.length) {
+          table.hidden = true;
+          empty.hidden = false;
+          updateMigrateButtonState();
+          return;
+        }
+        empty.hidden = true;
+        table.hidden = false;
+        for (const vm of vms) {
+          const tr = document.createElement("tr");
+          tr.className = "vm-row";
+          tr.dataset.vmName = vm.name;
+          const mor = (vm.vmware_moref && String(vm.vmware_moref).trim()) ? String(vm.vmware_moref) : "—";
+          const uuid = vm.uuid ? String(vm.uuid) : "—";
+          const pwr = vm.power_state ? String(vm.power_state) : "—";
+          tr.innerHTML =
+            '<td><input type="checkbox" class="vm-cb" /></td><td>' +
+            escapeHtml(vm.name) +
+            "</td><td>" +
+            escapeHtml(mor) +
+            "</td><td>" +
+            escapeHtml(uuid) +
+            "</td><td>" +
+            escapeHtml(pwr) +
+            "</td>";
+          const cb = tr.querySelector("input.vm-cb");
+          cb.setAttribute("aria-label", "Select " + vm.name);
+          cb.addEventListener("change", () => syncVmRow(tr));
+          tr.addEventListener("click", (ev) => {
+            if (ev.target.tagName === "INPUT") return;
+            cb.checked = !cb.checked;
+            syncVmRow(tr);
+          });
+          tbody.appendChild(tr);
+        }
+        updateMigrateButtonState();
+      } catch (e) {
+        statusEl.textContent = "";
+        banner(document.getElementById("global-banner"), "err", e.message || String(e));
+        table.hidden = true;
+        empty.hidden = false;
+        empty.textContent = "Could not load guests (check Proxmox default node and ESXi-linked storage).";
+        updateMigrateButtonState();
+      }
+    }
+
+    function setMigrateModal(open) {
+      const el = document.getElementById("migrate-modal");
+      el.classList.toggle("show", open);
+      el.setAttribute("aria-hidden", open ? "false" : "true");
+    }
+
+    async function loadProxmoxStorageDropdown() {
+      const sel = document.getElementById("mig-storage-select");
+      const hint = document.getElementById("mig-storage-hint");
+      const node = document.getElementById("mig-node").value.trim();
+      sel.innerHTML = "";
+      const optLoad = document.createElement("option");
+      optLoad.value = "";
+      optLoad.textContent = node ? "Loading storages…" : "Set node name first";
+      sel.appendChild(optLoad);
+      if (!node) {
+        hint.textContent = "Enter Proxmox node (or save default_node in config) to list storages.";
+        return;
+      }
+      try {
+        const data = await api("/api/ui/proxmox-storages?node=" + encodeURIComponent(node));
+        sel.innerHTML = "";
+        const ph = document.createElement("option");
+        ph.value = "";
+        ph.textContent = "— Select storage —";
+        sel.appendChild(ph);
+        for (const s of data.storages || []) {
+          const o = document.createElement("option");
+          o.value = s.id;
+          const ok = s.usable_for_vm_disks ? "OK for VM / disk import" : s.supports_disk_import ? "images, check active" : "no disk images";
+          o.textContent = s.id + " (" + s.type + ") — " + ok;
+          if (!s.enabled || s.active !== 1) {
+            o.disabled = true;
+            o.textContent += " (inactive on node)";
+          }
+          sel.appendChild(o);
+        }
+        hint.textContent =
+          "Node " +
+          data.node +
+          ": " +
+          (data.storages || []).length +
+          " storages. Use ZFS/RBD (or other “images”) targets to avoid filling the OS disk.";
+      } catch (e) {
+        sel.innerHTML = "";
+        const err = document.createElement("option");
+        err.value = "";
+        err.textContent = "(could not list storages)";
+        sel.appendChild(err);
+        hint.textContent = "List failed: " + (e.message || String(e)) + " — use manual storage ID.";
+      }
+    }
+
+    function getMigrateStorageValue() {
+      const selVal = document.getElementById("mig-storage-select").value.trim();
+      const manual = document.getElementById("mig-storage-manual").value.trim();
+      // Dropdown wins when set so a real choice is not ignored (manual is only for empty list / custom ID).
+      if (selVal) return selVal;
+      return manual;
+    }
+
+    function preselectStorageFromDefault(defStorage) {
+      const sel = document.getElementById("mig-storage-select");
+      const manual = document.getElementById("mig-storage-manual");
+      manual.value = "";
+      if (!defStorage) return;
+      for (let i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === defStorage && !sel.options[i].disabled) {
+          sel.selectedIndex = i;
+          return;
+        }
+      }
+      const hasSelectable = [...sel.options].some((o) => o.value && !o.disabled);
+      if (!hasSelectable) {
+        manual.value = defStorage;
+      }
+    }
+
+    async function openMigrateModal() {
+      const names = getSelectedVmNames();
+      if (!names.length) return;
+      document.getElementById("migrate-modal-summary").textContent =
+        names.length + " VM(s): " + names.slice(0, 5).join(", ") + (names.length > 5 ? "…" : "");
+      const vmdkHint = document.getElementById("mig-vmdk-hint");
+      document.getElementById("mig-storage-manual").value = "";
+      let defStorage = "";
+      let suggestedVmid = 3500;
+      try {
+        const nodeForQuery = document.getElementById("mig-node").value.trim();
+        const defsUrl = nodeForQuery
+          ? `/migration-defaults?proxmox_node=${encodeURIComponent(nodeForQuery)}`
+          : "/migration-defaults";
+        const defs = await api(defsUrl);
+        lastMigrationDefaults = defs;
+        document.getElementById("mig-ram").value = defs.memory_mb || 8192;
+        document.getElementById("mig-cores").value = defs.cores || 4;
+        document.getElementById("mig-vlan").value =
+          defs.vlan !== undefined && defs.vlan !== null && String(defs.vlan).trim() !== ""
+            ? String(defs.vlan)
+            : "";
+        document.getElementById("mig-node").value = defs.default_node || "";
+        defStorage = (defs.storage || "").trim();
+        const tmpl = (defs.vmdk_path_template || "").trim();
+        if (defs.vmdk_template_auto_esxi) {
+          lastVmdkHintText =
+            "import-from auto-esxi: paths are taken from Proxmox ESXi storage listings (same source the import UI uses). " +
+            "vCenter is only used if PVE cannot list a match, or to validate the VM list when PVE does not list every guest. " +
+            "First selected VM: " +
+            names[0] +
+            ".";
+        } else if (tmpl) {
+          const ex = tmpl.replaceAll("{vm_name}", names[0]);
+          if (tmpl.toLowerCase().startsWith("esxi:")) {
+            lastVmdkHintText =
+              "import-from uses your linked ESXi storage in Proxmox (PVE reads the disk from ESXi; no copy to the node). " +
+              "Template: " +
+              tmpl +
+              " — first VM resolves to: " +
+              ex +
+              ". Adjust folders/datacenter in config if inventory paths differ per VM.";
+          } else {
+            lastVmdkHintText =
+              "Each job uses import-from on the Proxmox node filesystem (vCenter is not contacted for the disk). " +
+              "Template: " +
+              tmpl +
+              " — first VM expects file: " +
+              ex +
+              ". Copy the exported .vmdk there or change the template.";
+          }
+        } else {
+          lastVmdkHintText =
+            "Set proxmox.vmdk_path_template in config.yaml: auto-esxi, or {vm_name} template, or an esxi:… URI if ESXi is linked in PVE.";
+        }
+        vmdkHint.textContent = lastVmdkHintText;
+        const simCb = document.getElementById("mig-simulated");
+        const simSrc = document.getElementById("mig-sim-source-vmid");
+        const savedSim = sessionStorage.getItem("migSimulated");
+        if (savedSim !== null) simCb.checked = savedSim === "1";
+        else simCb.checked = false;
+        simSrc.value = String(defs.simulated_clone_source_vmid || 147);
+        const savedCpu = sessionStorage.getItem("migCpuPreset");
+        const enableCpuPreset = !!savedCpu && savedCpu !== "none";
+        document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
+        document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
+          el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
+        });
+        syncMigrateCpuPresetUi();
+        if (defs.migration_vmid_min != null) suggestedVmid = defs.migration_vmid_min;
+        if (defs.next_free_proxmox_vmid != null)
+          suggestedVmid = Math.max(suggestedVmid, defs.next_free_proxmox_vmid);
+        const mh = document.getElementById("mig-vmid-hint");
+        if (mh && defs.migration_vmid_min != null && defs.migration_vmid_max != null) {
+          mh.textContent =
+            "Configured migration VMID range: " +
+            defs.migration_vmid_min +
+            "–" +
+            defs.migration_vmid_max +
+            ". Each selected VM gets the next free ID from your start value.";
+        }
+      } catch (_) {
+        lastMigrationDefaults = null;
+        document.getElementById("mig-ram").value = 8192;
+        document.getElementById("mig-cores").value = 4;
+        document.getElementById("mig-vlan").value = "";
+        lastVmdkHintText =
+          "Could not load migration defaults; check proxmox.vmdk_path_template (host path or esxi:…) before enqueueing.";
+        vmdkHint.textContent = lastVmdkHintText;
+        const simCb = document.getElementById("mig-simulated");
+        const simSrc = document.getElementById("mig-sim-source-vmid");
+        const savedSim = sessionStorage.getItem("migSimulated");
+        if (savedSim !== null) simCb.checked = savedSim === "1";
+        else simCb.checked = false;
+        simSrc.value = "147";
+        const savedCpu = sessionStorage.getItem("migCpuPreset");
+        const enableCpuPreset = !!savedCpu && savedCpu !== "none";
+        document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
+        document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
+          el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
+        });
+        syncMigrateCpuPresetUi();
+      }
+      applyMigrateSimulatedToggle();
+      await loadProxmoxStorageDropdown();
+      preselectStorageFromDefault(defStorage);
+      const migVmidInput = document.getElementById("mig-vmid-start");
+      if (lastMigrationDefaults && lastMigrationDefaults.migration_vmid_min != null) {
+        migVmidInput.min = String(lastMigrationDefaults.migration_vmid_min);
+      } else {
+        migVmidInput.min = "100";
+      }
+      const savedStart = sessionStorage.getItem("migVmidStart");
+      let startNum = savedStart !== null && savedStart !== "" ? parseInt(savedStart, 10) : suggestedVmid;
+      if (!Number.isFinite(startNum)) startNum = suggestedVmid;
+      migVmidInput.value = String(startNum);
+      setMigrateModal(true);
+    }
+
+    async function applyGate() {
+      const st = await api("/api/auth/status");
+      credentialsVerified = !!st.credentials_verified;
+      await loadCredentials();
+      const intro = document.getElementById("credentials-intro");
+      const btnCont = document.getElementById("btn-continue-dashboard");
+      if (credentialsVerified) {
+        intro.textContent =
+          "Change and save settings any time. Use the Guests tab for inventory. Run setup again from that page to re-verify Proxmox.";
+        btnCont.textContent = "Re-verify Proxmox (and VMware if configured)";
+      } else {
+        intro.textContent =
+          "Save Proxmox (required). Optionally save VMware for vCenter details on the list, then continue.";
+        btnCont.textContent = "Continue to guest list";
+      }
+      if (credentialsVerified) {
+        showAppView("home");
+        await loadVmList();
+        banner(document.getElementById("global-banner"), "info", "");
+      } else {
+        showAppView("credentials");
+        banner(
+          document.getElementById("global-banner"),
+          "info",
+          "Sign-in complete. Save Proxmox, optionally VMware, then continue to see migratable guests."
+        );
+      }
+    }
+
+    async function refreshAuth() {
+      const st = await api("/api/auth/status");
+      const login = document.getElementById("login-screen");
+      const app = document.getElementById("app-screen");
+      const health = document.getElementById("health-strip");
+      if (st.authenticated) {
+        show(login, false);
+        show(app, true);
+        show(health, true);
+        refreshHealthStrip();
+        await applyGate();
+      } else {
+        show(login, true);
+        show(app, false);
+        show(health, false);
+      }
+    }
+
+    function fillVmware(v) {
+      document.getElementById("vmw-host").value = v.host || "";
+      document.getElementById("vmw-port").value = v.port || 443;
+      document.getElementById("vmw-user").value = v.user || "";
+      document.getElementById("vmw-password").value = "";
+      document.getElementById("vmw-insecure").checked = !!v.insecure;
+      document.getElementById("vmw-pw-hint").textContent = v.password_set
+        ? "A password is saved. Enter a new one to replace it, or leave blank to keep it."
+        : "No password saved yet.";
+    }
+
+    function fillProxmox(p) {
+      document.getElementById("px-host").value = p.host || "";
+      document.getElementById("px-port").value = p.port || 8006;
+      document.getElementById("px-verify").checked = !!p.verify_ssl;
+      document.getElementById("px-node").value = p.default_node || "";
+      document.getElementById("px-token-id").value = p.api_token_id || "";
+      document.getElementById("px-token-secret").value = "";
+      document.getElementById("px-user").value = p.user || "";
+      document.getElementById("px-password").value = "";
+      document.getElementById("px-storage").value = p.storage || "";
+      document.getElementById("px-vlan").value =
+        p.vlan !== undefined && p.vlan !== null && String(p.vlan).trim() !== ""
+          ? String(p.vlan)
+          : "";
+      document.getElementById("px-net-mtu").value =
+        p.net_mtu != null && String(p.net_mtu).trim() !== "" ? String(p.net_mtu) : "1500";
+      document.getElementById("px-tok-hint").textContent = p.api_token_secret_set
+        ? "Token secret is saved. Enter a new secret to replace, or leave blank to keep."
+        : "No API token secret saved.";
+      document.getElementById("px-pw-hint").textContent = p.password_set
+        ? "A password is saved for user login. Leave blank to keep."
+        : "No Proxmox password saved (token auth may be in use).";
+    }
+
+    function currentBridgeFromUI() {
+      const sel = document.getElementById("px-bridge-select");
+      const other = document.getElementById("px-bridge-other");
+      if (!sel) return "";
+      if (sel.value === "__other__") return (other && other.value.trim()) || "";
+      return (sel.value || "").trim();
+    }
+
+    function syncBridgeOtherVisibility() {
+      const sel = document.getElementById("px-bridge-select");
+      const other = document.getElementById("px-bridge-other");
+      if (!sel || !other) return;
+      if (sel.value === "__other__") {
+        other.classList.remove("hidden");
+      } else {
+        other.classList.add("hidden");
+      }
+    }
+
+    async function refreshProxmoxBridgeSelect(savedBridge) {
+      const sel = document.getElementById("px-bridge-select");
+      const other = document.getElementById("px-bridge-other");
+      if (!sel || !other) return;
+      const node = document.getElementById("px-node").value.trim();
+      let bridges = [];
+      try {
+        const q = node ? `?node=${encodeURIComponent(node)}` : "";
+        const d = await api("/api/ui/proxmox-bridges" + q);
+        bridges = Array.isArray(d.bridges) ? d.bridges : [];
+      } catch (e) {
+        bridges = [];
+      }
+      if (!bridges.length) {
+        for (let i = 0; i <= 9; i++) bridges.push("vmbr" + i);
+      }
+      const cur = (savedBridge != null ? String(savedBridge).trim() : "") || currentBridgeFromUI();
+      sel.innerHTML = "";
+      const seen = new Set();
+      for (const b of bridges) {
+        if (!b || seen.has(b)) continue;
+        seen.add(b);
+        const opt = document.createElement("option");
+        opt.value = b;
+        opt.textContent = b;
+        sel.appendChild(opt);
+      }
+      const otherOpt = document.createElement("option");
+      otherOpt.value = "__other__";
+      otherOpt.textContent = "Other…";
+      sel.appendChild(otherOpt);
+      if (cur && seen.has(cur)) {
+        sel.value = cur;
+        other.classList.add("hidden");
+        other.value = "";
+      } else if (cur) {
+        sel.value = "__other__";
+        other.classList.remove("hidden");
+        other.value = cur;
+      } else {
+        sel.value = bridges[0] || "vmbr0";
+        other.classList.add("hidden");
+        other.value = "";
+      }
+      syncBridgeOtherVisibility();
+    }
+
+    async function loadCredentials() {
+      const data = await api("/api/ui/credentials");
+      fillVmware(data.vmware);
+      fillProxmox(data.proxmox);
+      await refreshProxmoxBridgeSelect(data.proxmox.bridge || "");
+    }
+
+    document.getElementById("btn-login").onclick = async () => {
+      const pw = document.getElementById("login-password").value;
+      const b = document.getElementById("login-banner");
+      try {
+        await api("/api/auth/login", { method: "POST", body: JSON.stringify({ password: pw }) });
+        banner(b, "", "");
+        await refreshAuth();
+      } catch (e) {
+        banner(b, "err", e.message || String(e));
+      }
+    };
+
+    document.getElementById("btn-logout").onclick = async () => {
+      await api("/api/auth/logout", { method: "POST", body: "{}" });
+      await refreshAuth();
+    };
+
+    document.getElementById("btn-save-vmw").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      const body = {
+        vmware: {
+          host: document.getElementById("vmw-host").value.trim(),
+          port: parseInt(document.getElementById("vmw-port").value, 10) || 443,
+          user: document.getElementById("vmw-user").value.trim(),
+          insecure: document.getElementById("vmw-insecure").checked,
+        },
+      };
+      const p = document.getElementById("vmw-password").value;
+      if (p) body.vmware.password = p;
+      try {
+        await api("/api/ui/credentials", { method: "PUT", body: JSON.stringify(body) });
+        banner(gb, "ok", "VMware settings saved.");
+        await loadCredentials();
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+
+    document.getElementById("btn-save-px").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      const br = currentBridgeFromUI();
+      if (!br) {
+        banner(gb, "err", "Choose a Linux bridge (vmbr*) from the list, or pick “Other…” and type the bridge name.");
+        return;
+      }
+      const body = {
+        proxmox: {
+          host: document.getElementById("px-host").value.trim(),
+          port: parseInt(document.getElementById("px-port").value, 10) || 8006,
+          verify_ssl: document.getElementById("px-verify").checked,
+          default_node: document.getElementById("px-node").value.trim(),
+          api_token_id: document.getElementById("px-token-id").value.trim(),
+          user: document.getElementById("px-user").value.trim(),
+          storage: document.getElementById("px-storage").value.trim(),
+          bridge: br,
+          net_mtu: parseInt(document.getElementById("px-net-mtu").value, 10) || 1500,
+        },
+      };
+      const vlanRaw = document.getElementById("px-vlan").value.trim();
+      if (vlanRaw) body.proxmox.vlan = parseInt(vlanRaw, 10);
+      else body.proxmox.vlan = "";
+      const ts = document.getElementById("px-token-secret").value;
+      if (ts) body.proxmox.api_token_secret = ts;
+      const pp = document.getElementById("px-password").value;
+      if (pp) body.proxmox.password = pp;
+      try {
+        await api("/api/ui/credentials", { method: "PUT", body: JSON.stringify(body) });
+        banner(gb, "ok", "Proxmox settings saved.");
+        await loadCredentials();
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+
+    document.getElementById("btn-test-vmw").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      const overrides = {
+        host: document.getElementById("vmw-host").value.trim() || null,
+        port: parseInt(document.getElementById("vmw-port").value, 10) || null,
+        user: document.getElementById("vmw-user").value.trim() || null,
+        insecure: document.getElementById("vmw-insecure").checked,
+      };
+      const p = document.getElementById("vmw-password").value;
+      if (p) overrides.password = p;
+      const keys = Object.keys(overrides).filter((k) => overrides[k] != null && overrides[k] !== "");
+      const body = keys.length ? { ...overrides } : {};
+      try {
+        const res = await api("/api/ui/test/vmware", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        banner(gb, res.ok ? "ok" : "err", res.ok ? res.message : res.message);
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+
+    document.getElementById("btn-test-px").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      const overrides = {
+        host: document.getElementById("px-host").value.trim() || null,
+        port: parseInt(document.getElementById("px-port").value, 10) || null,
+        verify_ssl: document.getElementById("px-verify").checked,
+        api_token_id: document.getElementById("px-token-id").value.trim() || null,
+        user: document.getElementById("px-user").value.trim() || null,
+      };
+      const ts = document.getElementById("px-token-secret").value;
+      if (ts) overrides.api_token_secret = ts;
+      const pp = document.getElementById("px-password").value;
+      if (pp) overrides.password = pp;
+      const clean = {};
+      for (const [k, v] of Object.entries(overrides)) {
+        if (v != null && v !== "") clean[k] = v;
+      }
+      try {
+        const res = await api("/api/ui/test/proxmox", {
+          method: "POST",
+          body: JSON.stringify(clean),
+        });
+        const msg = res.ok ? `${res.message} ${res.version ? JSON.stringify(res.version) : ""}` : res.message;
+        banner(gb, res.ok ? "ok" : "err", msg);
+        if (res.ok) {
+          try {
+            await refreshProxmoxBridgeSelect(currentBridgeFromUI());
+          } catch (_) {}
+        }
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+
+    document.getElementById("btn-refresh-bridges").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      try {
+        await refreshProxmoxBridgeSelect(currentBridgeFromUI());
+        banner(gb, "ok", "Bridge list updated from node.");
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+    document.getElementById("px-bridge-select").addEventListener("change", syncBridgeOtherVisibility);
+    document.getElementById("px-node").addEventListener("blur", async () => {
+      try {
+        await refreshProxmoxBridgeSelect(currentBridgeFromUI());
+      } catch (_) {}
+    });
+
+    document.getElementById("brand-link").onclick = (e) => {
+      e.preventDefault();
+      goVmwareHome();
+    };
+    document.getElementById("nav-home").onclick = () => goVmwareHome();
+    document.getElementById("nav-jobs").onclick = () => {
+      const gb = document.getElementById("global-banner");
+      if (!credentialsVerified) {
+        showAppView("credentials");
+        banner(gb, "info", "Complete Proxmox setup first, then open Migrations.");
+        return;
+      }
+      showAppView("jobs");
+    };
+    document.getElementById("nav-credentials").onclick = () => showAppView("credentials");
+    document.getElementById("btn-refresh-jobs").onclick = () => loadJobsList();
+    document.getElementById("jobs-select-all-pending").addEventListener("change", (e) => {
+      const want = e.target.checked;
+      document.querySelectorAll("#jobs-tbody input.job-pick:not(:disabled)").forEach((cb) => {
+        cb.checked = want;
+        const id = cb.getAttribute("data-job-id");
+        if (want) pendingJobSelection.add(id);
+        else pendingJobSelection.delete(id);
+      });
+      syncBulkCancelButton();
+    });
+    document.getElementById("btn-bulk-cancel-pending").onclick = () => bulkCancelPendingJobs();
+    document.getElementById("btn-job-detail-close").onclick = () => closeJobDetailPanel();
+    document.getElementById("btn-job-detail-copy").onclick = () => copyJobDiagnostics();
+    document.getElementById("btn-job-detail-refresh").onclick = () => refreshJobDetailPanel();
+    document.getElementById("btn-job-detail-stop").onclick = () => {
+      if (jobDetailJobId) requestStopJob(jobDetailJobId, false);
+    };
+    document.getElementById("job-detail-modal").addEventListener("click", (e) => {
+      if (e.target.id === "job-detail-modal") closeJobDetailPanel();
+    });
+    document.addEventListener("visibilitychange", () => {
+      const vj = document.getElementById("view-jobs");
+      if (!vj || vj.classList.contains("hidden")) return;
+      stopJobsPoll();
+      loadJobsList().finally(() => startJobsPoll());
+    });
+    document.getElementById("btn-help").onclick = () => setHelpModal(true);
+    document.getElementById("btn-help-close").onclick = () => setHelpModal(false);
+    document.getElementById("help-modal").addEventListener("click", (e) => {
+      if (e.target.id === "help-modal") setHelpModal(false);
+    });
+    (function wireHelpIndexLinks() {
+      const root = document.getElementById("help-modal");
+      if (!root) return;
+      root.querySelectorAll(".help-index a[href^='#']").forEach((a) => {
+        a.addEventListener("click", (e) => {
+          const id = (a.getAttribute("href") || "").slice(1);
+          const target = id ? document.getElementById(id) : null;
+          if (target) {
+            e.preventDefault();
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        });
+      });
+    })();
+    document.getElementById("btn-log-close").onclick = () => setLogModal(false);
+    document.getElementById("log-modal").addEventListener("click", (e) => {
+      if (e.target.id === "log-modal") setLogModal(false);
+    });
+    document.getElementById("btn-refresh-vms").onclick = () => loadVmList();
+    document.getElementById("vm-select-all").addEventListener("change", (e) => {
+      const on = e.target.checked;
+      document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {
+        cb.checked = on;
+        syncVmRow(cb.closest("tr"));
+      });
+    });
+    document.getElementById("btn-select-all-vms").onclick = () => {
+      document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {
+        cb.checked = true;
+        syncVmRow(cb.closest("tr"));
+      });
+    };
+    document.getElementById("btn-clear-vm-selection").onclick = () => {
+      document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {
+        cb.checked = false;
+        syncVmRow(cb.closest("tr"));
+      });
+    };
+    document.getElementById("btn-open-migrate-modal").onclick = () => openMigrateModal();
+    document.getElementById("mig-simulated").addEventListener("change", () => applyMigrateSimulatedToggle());
+    document.getElementById("mig-enable-cpu-preset").addEventListener("change", () => syncMigrateCpuPresetUi());
+    document.getElementById("mig-sim-source-vmid").addEventListener("input", () => {
+      if (document.getElementById("mig-simulated").checked) applyMigrateSimulatedToggle();
+    });
+    document.getElementById("mig-node").addEventListener("change", () => loadProxmoxStorageDropdown());
+    document.getElementById("mig-node").addEventListener("blur", () => loadProxmoxStorageDropdown());
+    document.getElementById("btn-migrate-cancel").onclick = () => setMigrateModal(false);
+    document.getElementById("migrate-modal").addEventListener("click", (e) => {
+      if (e.target.id === "migrate-modal") setMigrateModal(false);
+    });
+    document.getElementById("btn-migrate-confirm").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      const names = getSelectedVmNames();
+      const vmid = parseInt(document.getElementById("mig-vmid-start").value, 10);
+      const storage = getMigrateStorageValue();
+      const ram = parseInt(document.getElementById("mig-ram").value, 10);
+      const cores = parseInt(document.getElementById("mig-cores").value, 10);
+      const vlanRaw = document.getElementById("mig-vlan").value.trim();
+      const vlan = vlanRaw === "" ? null : parseInt(vlanRaw, 10);
+      const node = document.getElementById("mig-node").value.trim();
+      const isSimulated = document.getElementById("mig-simulated").checked;
+      const simSourceRaw = document.getElementById("mig-sim-source-vmid").value.trim();
+      const simSource = simSourceRaw ? parseInt(simSourceRaw, 10) : NaN;
+      if (!names.length || !storage || !Number.isFinite(vmid) || vmid < 100 || !Number.isFinite(ram) || !Number.isFinite(cores)) {
+        banner(gb, "err", "Fill all required fields (VM ID ≥ 100, storage, RAM, cores).");
+        return;
+      }
+      if (isSimulated && (!Number.isFinite(simSource) || simSource < 100)) {
+        banner(gb, "err", "Set a valid simulated source template VMID (>= 100).");
+        return;
+      }
+      if (vlanRaw !== "" && (!Number.isFinite(vlan) || vlan < 1 || vlan > 4094)) {
+        banner(gb, "err", "Set VLAN between 1 and 4094, or leave it empty.");
+        return;
+      }
+      const enableCpuPreset = document.getElementById("mig-enable-cpu-preset").checked;
+      const cpuEl = document.querySelector('input[name="mig-cpu-preset"]:checked');
+      const qemu_cpu_preset = enableCpuPreset && cpuEl ? cpuEl.value : null;
+      const body = {
+        vm_names: names,
+        proxmox_vmid_start: vmid,
+        proxmox_storage: storage,
+        memory_mb: ram,
+        cores: cores,
+        simulated_import: isSimulated,
+      };
+      if (qemu_cpu_preset) body.qemu_cpu_preset = qemu_cpu_preset;
+      if (isSimulated) body.simulated_clone_source_vmid = simSource;
+      if (vlanRaw !== "") body.vlan = vlan;
+      if (node) body.proxmox_node = node;
+      try {
+        const res = await api("/jobs/migrate-selected", { method: "POST", body: JSON.stringify(body) });
+        sessionStorage.setItem("migVmidStart", String(res.next_proxmox_vmid));
+        sessionStorage.setItem("migSimulated", document.getElementById("mig-simulated").checked ? "1" : "0");
+        sessionStorage.setItem("migCpuPreset", qemu_cpu_preset || "none");
+        setMigrateModal(false);
+        document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {
+          cb.checked = false;
+          syncVmRow(cb.closest("tr"));
+        });
+        let okMsg =
+          "Enqueued " +
+          res.enqueued +
+          " migration job(s). Next suggested Proxmox VM ID: " +
+          res.next_proxmox_vmid +
+          ". Keep the worker running. Open the Migrations tab to watch progress and logs.";
+        if (res.proxmox_vmid_auto_adjusted && Array.isArray(res.proxmox_vmids_assigned)) {
+          okMsg +=
+            " Assigned Proxmox VM IDs: " +
+            res.proxmox_vmids_assigned.join(", ") +
+            " (requested start " +
+            res.proxmox_vmid_start_requested +
+            " was not fully free on the node).";
+        }
+        banner(gb, "ok", okMsg);
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+    document.getElementById("btn-continue-dashboard").onclick = async () => {
+      const gb = document.getElementById("global-banner");
+      try {
+        const res = await api("/api/ui/complete-onboarding", { method: "POST", body: "{}" });
+        if (res.ok) {
+          credentialsVerified = true;
+          showAppView("home");
+          setNavActive("home");
+          await loadVmList();
+          if (res.vmware_configured && res.vmware_ok === false) {
+            banner(
+              gb,
+              "info",
+              "Proxmox OK. VMware test failed (" +
+                res.vmware +
+                ") — you can still migrate from the ESXi storage list. Fix VMware settings to add power/uuid from vCenter."
+            );
+          } else if (res.vmware_configured && res.vmware_ok) {
+            banner(gb, "ok", "Proxmox and VMware OK. Matching guests show vCenter MoRef, UUID, and power.");
+          } else {
+            banner(
+              gb,
+              "ok",
+              "Proxmox OK. Guests are listed from ESXi-linked storage on PVE (add VMware anytime for extra columns)."
+            );
+          }
+        } else {
+          banner(
+            gb,
+            "err",
+            "Proxmox: " +
+              (res.proxmox_message || "") +
+              (res.vmware_message ? " — VMware: " + res.vmware_message : "")
+          );
+        }
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    };
+    document.getElementById("link-setup-again").onclick = async (e) => {
+      e.preventDefault();
+      const gb = document.getElementById("global-banner");
+      try {
+        await api("/api/ui/reopen-credentials-setup", { method: "POST", body: "{}" });
+        credentialsVerified = false;
+        await applyGate();
+      } catch (err) {
+        banner(gb, "err", err.message || String(err));
+      }
+    };
+
+    refreshHealthStrip();
+    setInterval(refreshHealthStrip, HEALTH_POLL_MS);
+
+    refreshAuth().catch(() => {
+      show(document.getElementById("login-screen"), true);
+      show(document.getElementById("app-screen"), false);
+    });
+  </script>
+</body>
+</html>

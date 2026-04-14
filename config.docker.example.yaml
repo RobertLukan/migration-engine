@@ -1,0 +1,75 @@
+# Copy to config.docker.yaml and adjust, or bind-mount your own file.
+# Redis hostname must match the compose service name (default: redis).
+
+ui:
+  password: "change-me-dashboard"
+  session_secret: "change-me-use-a-long-random-string-at-least-32-chars"
+vmware:
+  host: "10.0.0.1"
+  port: 443
+  user: "user@example.local"
+  password: "CHANGE_ME"
+  insecure: true
+proxmox:
+  host: "10.0.0.2"
+  port: 8006
+  verify_ssl: false
+  default_node: pve
+  api_token_id: root@pam!migration
+  api_token_secret: "CHANGE_ME"
+  user: root@pam
+  password: ""
+  # Optional high-privilege helper ONLY for qemu args= (root-restricted in PVE).
+  # args_helper_user: root@pam
+  # args_helper_password: "CHANGE_ME"
+  # args_helper_token_id: "root@pam!migration-args"
+  # args_helper_token_secret: "CHANGE_ME"
+  storage: local-lvm
+  bridge: vmbr0
+  vlan: ""
+  net_mtu: 1500
+  memory_mb: 8192
+  cores: 4
+  ostype: win10
+  vmdk_path_template: auto-esxi
+  simulated_import: true
+  simulated_clone_source_vmid: 147
+  simulated_clone_source_node: ""
+  efi_tpm_disk_format: raw
+  efidisk0: ""
+  import_disk_format: raw
+  # Production-style safety (see main config.yaml). For local Docker lab, leave commented or
+  # match the VMIDs you enqueue. Ceph: use Proxmox storage id here, not only the Ceph pool name.
+  # safety:
+  #   allowed_vmid_min: 3500
+  #   allowed_vmid_max: 4000
+  #   allowed_storage_ids:
+  #     - ceph-migrate-rbd
+  #   scratch_purge_require_vm_disk_name: true
+redis:
+  url: redis://redis:6379/0
+  queue_key: migration:queue
+  job_key_prefix: "migration:job:"
+  job_log_suffix: :log
+worker:
+  max_concurrent_imports: 3
+  guest_agent_poll_interval_sec: 5
+  guest_agent_ip_timeout_sec: 1800
+  shutdown_timeout_sec: 300
+  task_poll_interval_sec: 2
+  vm_shutdown_max_attempts: 24
+  vm_shutdown_retry_delay_sec: 5
+  shutdown_api_timeout_sec: 120
+  pre_scsi_swap_scratch_disk_size: 2G
+  post_first_boot_agent_grace_sec: 60
+  post_scsi_swap_guest_agent_timeout_sec: 1800
+winrm:
+  port: 5985
+  transport: ntlm
+  server_cert_validation: ignore
+  operation_timeout_sec: 300
+  read_timeout_sec: 600
+horizon:
+  powershell_script: |
+    $ErrorActionPreference = 'Stop'
+    Write-Host 'Horizon script placeholder for lab image.'

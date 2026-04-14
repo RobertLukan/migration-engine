@@ -1,0 +1,40 @@
+# Used only by pytest (MIGRATION_ENGINE_CONFIG). Not for production.
+ui:
+  password: "test-dashboard-secret"
+  session_secret: "test-session-secret-must-be-long-enough-for-itsdangerous-32"
+vmware:
+  host: ""
+  port: 443
+  user: ""
+  password: ""
+  insecure: false
+proxmox:
+  host: "127.0.0.1"
+  port: 8006
+  verify_ssl: false
+  default_node: pve
+  api_token_id: root@pam!migration
+  api_token_secret: "unused-in-tests"
+  user: root@pam
+  password: ""
+  storage: local-lvm
+  bridge: vmbr0
+  vlan: ""
+  net_mtu: 1500
+  memory_mb: 8192
+  cores: 4
+  ostype: win10
+  vmdk_path_template: auto-esxi
+  simulated_import: true
+  simulated_clone_source_vmid: 999
+  simulated_clone_source_node: ""
+  efi_tpm_disk_format: raw
+  efidisk0: ""
+  import_disk_format: raw
+redis:
+  url: redis://127.0.0.1:6379/15
+  queue_key: "migration:test:queue:"
+  job_key_prefix: "migration:test:job:"
+  job_log_suffix: ":log"
+worker:
+  max_concurrent_imports: 1
