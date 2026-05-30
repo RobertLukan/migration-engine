@@ -1,6 +1,7 @@
 """
 Redis-driven migration worker: Proxmox import + SATA first-boot (with a small SCSI scratch disk),
-grace shutdown, SATA→SCSI disk move, second-boot guest-agent wait, then Horizon via WinRM.
+grace shutdown, SATA→SCSI disk move, second-boot guest-agent wait. Horizon/WinRM guest automation
+is optional and commonly kept as a placeholder hook for future workflows.
 Max concurrent VMDK imports enforced with a semaphore; hardware steps wrapped with Redis error logging.
 """
 

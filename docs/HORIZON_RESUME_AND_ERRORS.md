@@ -1,6 +1,7 @@
 # Horizon step failures, resume, and error handling (design notes)
 
 Notes from a design discussion to revisit **after** you have the Omnissa / Horizon PowerShell script in place. Nothing here is implemented unless the codebase explicitly says so elsewhere.
+In the current stable release, this entire Horizon/WinRM path is usually kept as an optional placeholder.
 
 ---
 

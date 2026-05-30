@@ -467,7 +467,8 @@
               This dashboard drives a <strong>VMware → Proxmox</strong> migration pipeline: you pick guests, enqueue
               jobs, and a <strong>worker</strong> (separate process) performs import, disk layout, reboots, and guest
               steps. It fits <strong>batch / VDI-style</strong> moves when combined with your own Horizon / Omnissa guest
-              scripts in configuration.
+              scripts in configuration. This project was created primarily for <strong>Windows 11 VDI</strong> migration,
+              but can also be used for recent <strong>Windows Server</strong> guests.
             </p>
 
             <h4 id="help-workflow">Typical workflow</h4>
@@ -490,14 +491,15 @@
             <h4 id="help-features-technical">API, worker, safety &amp; deployment</h4>
             <ul>
               <li><strong>Safety</strong> — Optional <code>proxmox.safety</code> envelope (VMID range, storage allowlist, scratch purge naming) enforced on enqueue/worker.</li>
-              <li><strong>Worker pipeline</strong> — Import / simulated clone, SATA boot path, guest agent, SCSI swap, configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
+              <li><strong>Worker pipeline</strong> — Import / simulated clone, SATA boot path, guest agent, SCSI swap; optional <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) hook kept mainly as a placeholder for future guest automation.</li>
               <li><strong>REST</strong> — Authenticated <code>/jobs</code>, <code>/vms</code>, <code>/migration-defaults</code>, etc.; public <code>/health</code> and <code>/version</code>.</li>
               <li><strong>Deploy</strong> — Docker Compose stack documented (API + worker + optional Redis); nginx reverse-proxy notes.</li>
             </ul>
 
             <h4 id="help-horizon">Horizon / guest automation (today)</h4>
             <p>
-              After the VM is on Proxmox, the worker runs your <strong>PowerShell</strong> over WinRM from
+              The WinRM/Horizon step is optional in this release and is commonly left as a placeholder script.
+              When enabled, the worker runs your <strong>PowerShell</strong> over WinRM from
               <code>horizon.powershell_script</code> in <code>config.yaml</code>. There is <strong>no</strong> built-in
               Connection Server REST client yet (pool moves, re-register to manual pool, etc. are design notes under
               <code>docs/</code>).
@@ -584,15 +586,10 @@
               Host CPU, nested virtualization enabled, VBS enabled
             </label>
           </fieldset>
-          <div class="inline" style="margin-top: 0.5rem">
-            <input type="checkbox" id="mig-simulated" />
-            <label for="mig-simulated" style="margin: 0">Simulated import (clone Proxmox template VM instead of VMware disk import)</label>
-          </div>
-          <div id="mig-sim-source-wrap" class="hidden">
-            <label for="mig-sim-source-vmid">Simulated source template VMID</label>
-            <input id="mig-sim-source-vmid" type="number" min="100" step="1" placeholder="e.g. 147" />
-          </div>
-          <p class="hint" id="mig-simulated-hint"></p>
+          <input type="hidden" id="mig-simulated" />
+          <input type="hidden" id="mig-sim-source-vmid" />
+          <div id="mig-sim-source-wrap" class="hidden"></div>
+          <p class="hint hidden" id="mig-simulated-hint"></p>
           <div class="actions">
             <button type="button" class="primary" id="btn-migrate-confirm">Enqueue migration</button>
             <button type="button" class="secondary" id="btn-migrate-cancel">Cancel</button>
@@ -1615,10 +1612,8 @@
         vmdkHint.textContent = lastVmdkHintText;
         const simCb = document.getElementById("mig-simulated");
         const simSrc = document.getElementById("mig-sim-source-vmid");
-        const savedSim = sessionStorage.getItem("migSimulated");
-        if (savedSim !== null) simCb.checked = savedSim === "1";
-        else simCb.checked = false;
-        simSrc.value = String(defs.simulated_clone_source_vmid || 147);
+        simCb.checked = false;
+        simSrc.value = "";
         const savedCpu = sessionStorage.getItem("migCpuPreset");
         const enableCpuPreset = !!savedCpu && savedCpu !== "none";
         document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
@@ -1648,10 +1643,8 @@
         vmdkHint.textContent = lastVmdkHintText;
         const simCb = document.getElementById("mig-simulated");
         const simSrc = document.getElementById("mig-sim-source-vmid");
-        const savedSim = sessionStorage.getItem("migSimulated");
-        if (savedSim !== null) simCb.checked = savedSim === "1";
-        else simCb.checked = false;
-        simSrc.value = "147";
+        simCb.checked = false;
+        simSrc.value = "";
         const savedCpu = sessionStorage.getItem("migCpuPreset");
         const enableCpuPreset = !!savedCpu && savedCpu !== "none";
         document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
@@ -2085,15 +2078,9 @@
       const vlanRaw = document.getElementById("mig-vlan").value.trim();
       const vlan = vlanRaw === "" ? null : parseInt(vlanRaw, 10);
       const node = document.getElementById("mig-node").value.trim();
-      const isSimulated = document.getElementById("mig-simulated").checked;
-      const simSourceRaw = document.getElementById("mig-sim-source-vmid").value.trim();
-      const simSource = simSourceRaw ? parseInt(simSourceRaw, 10) : NaN;
+      const isSimulated = false;
       if (!names.length || !storage || !Number.isFinite(vmid) || vmid < 100 || !Number.isFinite(ram) || !Number.isFinite(cores)) {
         banner(gb, "err", "Fill all required fields (VM ID ≥ 100, storage, RAM, cores).");
-        return;
-      }
-      if (isSimulated && (!Number.isFinite(simSource) || simSource < 100)) {
-        banner(gb, "err", "Set a valid simulated source template VMID (>= 100).");
         return;
       }
       if (vlanRaw !== "" && (!Number.isFinite(vlan) || vlan < 1 || vlan > 4094)) {
@@ -2112,13 +2099,12 @@
         simulated_import: isSimulated,
       };
       if (qemu_cpu_preset) body.qemu_cpu_preset = qemu_cpu_preset;
-      if (isSimulated) body.simulated_clone_source_vmid = simSource;
       if (vlanRaw !== "") body.vlan = vlan;
       if (node) body.proxmox_node = node;
       try {
         const res = await api("/jobs/migrate-selected", { method: "POST", body: JSON.stringify(body) });
         sessionStorage.setItem("migVmidStart", String(res.next_proxmox_vmid));
-        sessionStorage.setItem("migSimulated", document.getElementById("mig-simulated").checked ? "1" : "0");
+        sessionStorage.setItem("migSimulated", "0");
         sessionStorage.setItem("migCpuPreset", qemu_cpu_preset || "none");
         setMigrateModal(false);
         document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {

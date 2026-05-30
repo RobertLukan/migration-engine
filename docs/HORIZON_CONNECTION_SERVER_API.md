@@ -2,6 +2,8 @@
 
 Design note: using **Connection Server REST** from this app (e.g. move or re-register a desktop from an **automatic** vSphere-backed pool toward a **manual** pool after migration to Proxmox).
 
+For the current stable release, Horizon/WinRM integration is treated as an **optional placeholder path** rather than a required workflow stage.
+
 ---
 
 ## Is it a good idea?
