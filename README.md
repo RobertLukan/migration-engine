@@ -38,11 +38,25 @@ CPU behavior is intentionally split into two modes:
   - The advanced flag list is tuned for specific host CPU/platform behavior and is **not universal**.
   - Before enabling advanced flags in production, the list should be reviewed and confirmed by a Proxmox/hypervisor admin for your exact hardware generation and cluster policy.
 
-Where this is changed:
+### Where an admin changes custom CPU settings
 
-- **UI:** migrate dialog -> enable custom CPU preset.
-- **API:** `qemu_cpu_preset` field on `POST /jobs` and `POST /jobs/migrate-selected`.
-- **Worker config path:** advanced preset resolves to `qemu args=` update.
+Use this quick map when you need to find CPU controls:
+
+- **Operator UI path (per migration job):**
+  - Guests -> Migrate selected -> enable custom CPU preset.
+  - This sets `qemu_cpu_preset` on the job request.
+
+- **API path (per migration job):**
+  - `POST /jobs` -> set `qemu_cpu_preset`
+  - `POST /jobs/migrate-selected` -> set `qemu_cpu_preset`
+
+- **Config path (cluster/environment level):**
+  - `config.yaml` -> `proxmox.args_helper_*` credentials for root-capable `args=` writes.
+  - `config.yaml` -> default Proxmox target settings (`proxmox.*`) used by jobs.
+
+- **Code path (for administrators/developers changing preset definitions):**
+  - `worker.py` -> `QEMU_CPU_PRESET_ARGS` (the actual advanced `-cpu ...` argument strings).
+  - `static/index.html` -> migrate modal CPU preset options shown to operators.
 
 Root-level requirement for advanced mode:
 
