@@ -13,6 +13,7 @@ This automation assumes Windows guests are prepared before migration:
 
 1. VirtIO/phantom device preparation is already done on the source VM so the guest can boot on Proxmox without the legacy SATA -> SCSI shuffle.
 2. VMware Tools are removed before migration (or handled by your existing pre-cutover process).
+3. Horizon agent uninstall/install/configuration is handled by your endpoint management workflow (in our case **Microsoft SCCM**) before/after cutover.
 
 Reference guide used by the team for this prep workflow:
 
@@ -22,6 +23,7 @@ Reference guide used by the team for this prep workflow:
 
 - WinRM/Horizon hooks are optional and currently treated as placeholder integration points for future workflows.
 - Core migration path focuses on disk import and bootability on Proxmox with the prepared guest.
+- Horizon lifecycle handling (remove/reinstall/configure agent) is expected to be done externally (e.g., SCCM), not by this tool's default workflow.
 
 ## CPU options (default vs advanced)
 
