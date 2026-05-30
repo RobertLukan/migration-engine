@@ -81,7 +81,7 @@ docker compose up -d
 
 - **`MIGRATION_ENGINE_CONFIG`**: path to YAML inside the container (default `/app/config.docker.yaml`). Set in compose for both `api` and `worker`.
 - **`MIGRATION_ENGINE_GIT_REVISION`** (optional): short commit or build id; exposed in **`GET /version`** and the in-app Help panel for “which build is running?”.
-- **Optional root-only args helper credentials** under `proxmox.args_helper_*`: used only by the worker when writing `qemu args=` (required on PVE because only root can set `args`).
+- **Optional root-only args helper credentials** under `proxmox.args_helper_*`: used only by the worker when writing `qemu args=` (required on PVE because only root can set `args`). This advanced `args=` path is mainly for VBS-focused CPU tuning and should be validated by an admin for your hardware before use.
 
 ## Vulnerability scans (Trivy, Grype, Docker Scout, etc.)
 

@@ -23,6 +23,35 @@ Reference guide used by the team for this prep workflow:
 - WinRM/Horizon hooks are optional and currently treated as placeholder integration points for future workflows.
 - Core migration path focuses on disk import and bootability on Proxmox with the prepared guest.
 
+## CPU options (default vs advanced)
+
+CPU behavior is intentionally split into two modes:
+
+- **Default mode (recommended):** `cpu=host`
+  - This is the baseline and does not require root-only `args=` updates.
+  - Use this for most migrations unless you have a validated hardware-specific need.
+
+- **Advanced mode (hardware-specific):** custom `args=` CPU flags
+  - This path is primarily used to support **Windows VBS** scenarios.
+  - The advanced flag list is tuned for specific host CPU/platform behavior and is **not universal**.
+  - Before enabling advanced flags in production, the list should be reviewed and confirmed by a Proxmox/hypervisor admin for your exact hardware generation and cluster policy.
+
+Where this is changed:
+
+- **UI:** migrate dialog -> enable custom CPU preset.
+- **API:** `qemu_cpu_preset` field on `POST /jobs` and `POST /jobs/migrate-selected`.
+- **Worker config path:** advanced preset resolves to `qemu args=` update.
+
+Root-level requirement for advanced mode:
+
+- Proxmox allows writing `args=` only for a root-capable account/token.
+- Configure one of these in `config.yaml` under `proxmox`:
+  - `args_helper_user` + `args_helper_password` (typically `root@pam`), or
+  - `args_helper_token_id` + `args_helper_token_secret` (root-capable token).
+- If not configured, advanced preset jobs fail with a permissions error when the worker tries to set `args=`.
+
+In short: default is `cpu=host`; `args=` is an expert path mainly for VBS compatibility/performance tuning and needs a root-capable Proxmox helper credential.
+
 ## Parallel imports (key capability)
 
 One of the strongest features of this tool is controlled **parallel disk import**.
