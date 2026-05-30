@@ -1,0 +1,23 @@
+# Self-hosted CI on your Docker VM (Portainer: add stack from this file or from Git).
+# Uses only tests/fixtures/minimal_config.yaml — do not mount production config.yaml here.
+#
+# One-shot (host shell, from repo root):
+#   docker compose -f docker-compose.ci.yml run --rm ci
+#
+# Build only:
+#   docker compose -f docker-compose.ci.yml build ci
+#
+# Portainer: build the image (Dockerfile.ci) or add a stack from this file and use “Run” / console
+# to execute `pytest` once; avoid mounting real config.yaml (fixture inside the image is enough).
+
+services:
+  ci:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+    image: migration-engine-ci:latest
+    environment:
+      MIGRATION_ENGINE_CONFIG: /app/tests/fixtures/minimal_config.yaml
+    # Override for a single test file, e.g.:
+    # command: ["pytest", "-q", "tests/test_health.py"]
+    command: ["pytest", "-q", "--tb=short"]

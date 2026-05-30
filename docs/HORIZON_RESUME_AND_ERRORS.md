@@ -77,3 +77,13 @@ Resume fixes **one class** of problem (guest-side automation). Mass Horizon migr
 - **Wave planning**, capacity, and rollback — usually runbooks and CMDB, not only code.
 
 Keep this file as a **design memo**; when you implement resume, add a line here pointing to the PR or commit and update **PRODUCT.md** if you track roadmap there.
+
+---
+
+## Related implemented add-on: pre-imported disk mode
+
+For large VMs where operators manually perform import on Proxmox (`qm importdisk`) after creating VM shell:
+
+- API supports `preimported_disk_mode=true` on `POST /jobs`.
+- Worker skips `import-from` and normalizes existing disk attachment to `sata0` before continuing.
+- VMID must already exist on the target node in this mode.

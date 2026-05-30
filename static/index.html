@@ -67,7 +67,11 @@
       color: var(--text);
       margin-bottom: 0.75rem;
     }
-    input[type="checkbox"] { width: auto; margin-right: 0.35rem; }
+    input[type="checkbox"], input[type="radio"] {
+      width: auto;
+      margin-right: 0.35rem;
+      margin-bottom: 0;
+    }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
     @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
     .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
@@ -121,6 +125,23 @@
     tr.vm-row { cursor: pointer; }
     tr.vm-row:hover { background: rgba(61, 139, 253, 0.08); }
     tr.vm-row.selected { background: rgba(61, 139, 253, 0.12); }
+    .vm-migration-prior-cell {
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }
+    .vm-migration-prior-cell .vm-migration-ok {
+      color: #2e7d32;
+    }
+    .vm-migration-prior-cell .vm-migration-fail {
+      color: #c62828;
+    }
+    .vm-migration-prior-cell .vm-migration-cancel {
+      color: #6a6a6a;
+    }
+    .vm-migration-prior-cell .vm-migration-active {
+      color: #b8860b;
+      font-weight: 600;
+    }
     .modal-backdrop {
       display: none;
       position: fixed;
@@ -255,6 +276,21 @@
       color: var(--muted);
       margin: 0 0 0.5rem;
     }
+    .job-import-queue-cell {
+      max-width: 14rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .vm-storage-cell {
+      max-width: 12rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+      font-size: 0.88rem;
+    }
     #job-detail-log-pre {
       max-height: 42vh;
     }
@@ -334,6 +370,22 @@
     .help-index a:hover {
       text-decoration: underline;
     }
+    .app-footer {
+      margin-top: auto;
+      padding: 0.65rem 1.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+      max-width: 52rem;
+      margin-left: auto;
+      margin-right: auto;
+      width: 100%;
+    }
+    #login-screen main {
+      min-height: 60vh;
+      display: flex;
+      flex-direction: column;
+    }
   </style>
 </head>
 <body>
@@ -354,6 +406,9 @@
           <button type="button" class="primary" id="btn-login">Sign in</button>
         </div>
       </div>
+      <footer class="app-footer" aria-label="Application version">
+        <span id="login-version-footer">Loading version…</span>
+      </footer>
     </main>
   </div>
 
@@ -361,6 +416,7 @@
     <header>
       <h1><a class="brand" href="#" id="brand-link">Migration orchestrator</a></h1>
       <nav class="actions">
+        <span id="header-version-chip" class="hint" style="margin: 0 0.25rem 0 0">Version …</span>
         <button type="button" class="secondary nav" id="nav-home">Guests</button>
         <button type="button" class="secondary nav" id="nav-jobs">Migrations</button>
         <button type="button" class="secondary nav" id="nav-credentials">Settings</button>
@@ -375,13 +431,21 @@
         <div class="card">
           <h2>Guests available to migrate</h2>
           <p class="hint" id="vm-list-intro">
-            Select guests with the checkboxes (or click a row), then <strong>Migrate selected</strong>. By default, names come from <strong>ESXi-linked storage</strong> on your Proxmox node. If you save VMware credentials and they verify, <strong>power</strong> and <strong>UUID</strong> are filled from vCenter for matching names.
+            Select guests with the checkboxes (or click a row), then <strong>Migrate selected</strong>. By default, names come from <strong>ESXi-linked storage</strong> on your Proxmox node. <strong>PVE ESXi storages</strong> lists Proxmox storage ids where each guest appears (each id is its own import permit bucket for volid paths — pick guests on different ids to run disk imports in parallel). <strong>Size</strong> is from the Proxmox listing for the chosen disk (metadata only). If you save VMware credentials and they verify, <strong>power</strong> and <strong>UUID</strong> are filled from vCenter for matching names. <strong>Prior migration</strong> summarizes past jobs from Redis (hover for job id and time); you can still re-migrate — a notice appears in the migrate dialog when relevant.
           </p>
           <div class="actions" style="margin-bottom: 0.75rem;">
             <button type="button" class="secondary" id="btn-refresh-vms">Refresh list</button>
             <button type="button" class="secondary" id="btn-select-all-vms">Select all</button>
             <button type="button" class="secondary" id="btn-clear-vm-selection">Clear selection</button>
             <button type="button" class="primary" id="btn-open-migrate-modal" disabled>Migrate selected…</button>
+            <button
+              type="button"
+              class="secondary"
+              id="btn-enqueue-efi-redo"
+              title="If VMs are selected, only those are considered. With no selection, all cluster VMs tagged migrated+efi-redo-pending are considered."
+            >
+              Enqueue EFI redo (tagged)
+            </button>
           </div>
           <div id="vm-list-status" class="hint"></div>
           <div style="overflow-x: auto;">
@@ -390,6 +454,9 @@
                 <tr>
                   <th style="width:2.5rem;"><input type="checkbox" id="vm-select-all" title="Select all" /></th>
                   <th>Name</th>
+                  <th>PVE ESXi storages</th>
+                  <th>Size</th>
+                  <th>Prior migration</th>
                   <th>MoRef</th>
                   <th>UUID</th>
                   <th>Power</th>
@@ -411,6 +478,10 @@
           <p class="hint" id="jobs-poll-hint">
             States update from Redis while the worker runs. The list refreshes about every <strong>5s</strong> while this
             tab is visible, and about every <strong>20s</strong> when the browser tab is in the background.
+            <strong>VMware / import queue</strong> shows the configured vCenter or ESXi API host, import path, and which
+            jobs share the same import permit bucket (same bucket ⇒ capped together during the disk pull only; hover for
+            full detail). It also shows whether a job is <strong>Waiting</strong> (bucket busy) or
+            <strong>Import running</strong> (permit acquired). The status line counts waiting/running by bucket.
           </p>
           <div class="actions" style="margin-bottom: 0.75rem;">
             <button type="button" class="secondary" id="btn-refresh-jobs">Refresh now</button>
@@ -429,6 +500,7 @@
                   <th>VM name</th>
                   <th>PVE ID</th>
                   <th>Node</th>
+                  <th>VMware / import queue</th>
                   <th>State</th>
                   <th>Progress</th>
                   <th>Updated</th>
@@ -454,6 +526,7 @@
               <li><a href="#help-workflow">Workflow</a></li>
               <li><a href="#help-features-ui">Dashboard &amp; UI</a></li>
               <li><a href="#help-features-technical">API &amp; worker</a></li>
+              <li><a href="#help-import-permits">Import permits &amp; parallelism</a></li>
               <li><a href="#help-horizon">Horizon / guest</a></li>
               <li><a href="#help-roadmap">Roadmap</a></li>
               <li><a href="#help-security">Security</a></li>
@@ -480,9 +553,14 @@
             <h4 id="help-features-ui">Dashboard &amp; operator features</h4>
             <ul>
               <li><strong>Session UI</strong> — Password login; dashboard after credential verification gate.</li>
-              <li><strong>Guests</strong> — Inventory from Proxmox ESXi-linked storage; optional vCenter merge (MoRef, UUID, power) when VMware is configured.</li>
+              <li>
+                <strong>Guests</strong> — Inventory from Proxmox ESXi-linked storage; optional vCenter merge (MoRef,
+                UUID, power) when VMware is configured. <strong>PVE ESXi storages</strong> shows which linked-storage ids
+                list each guest (parallel import-from across different ids when permitted). <strong>Size</strong> uses
+                the listing&apos;s <code>size</code> field for the chosen disk.
+              </li>
               <li><strong>Migrate</strong> — Per-VM Proxmox VMID allocation, node, storage (dropdown + manual), RAM/CPU, optional QEMU CPU preset (nested/VBS), optional <strong>simulated import</strong> (clone template on PVE).</li>
-              <li><strong>Migrations</strong> — Redis-backed states; list with progress bar; <strong>Details</strong> (timeline, error, log tail with auto-refresh, copy diagnostics); <strong>Logs</strong> modal; <strong>Stop</strong>; <strong>bulk cancel</strong> for PENDING; polling slows when the browser tab is hidden.</li>
+              <li><strong>Migrations</strong> — Redis-backed states; list with progress bar; <strong>VMware / import queue</strong> (API host, import path, shared permit bucket for parallelism); <strong>Details</strong> (timeline, error, log tail with auto-refresh, copy diagnostics); <strong>Logs</strong> modal; <strong>Stop</strong>; <strong>bulk cancel</strong> for PENDING; polling slows when the browser tab is hidden.</li>
               <li><strong>Settings</strong> — Load/save <code>config.yaml</code> sections with masked secrets; test Proxmox and VMware connections.</li>
               <li><strong>Services strip</strong> — <code>GET /health</code>: config + Redis + Proxmox (required); VMware (optional, warning not red).</li>
             </ul>
@@ -490,10 +568,46 @@
             <h4 id="help-features-technical">API, worker, safety &amp; deployment</h4>
             <ul>
               <li><strong>Safety</strong> — Optional <code>proxmox.safety</code> envelope (VMID range, storage allowlist, scratch purge naming) enforced on enqueue/worker.</li>
-              <li><strong>Worker pipeline</strong> — Import / simulated clone, SATA boot path, guest agent, SCSI swap, configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
+              <li><strong>Worker pipeline</strong> — Import / simulated clone, direct <code>scsi0</code> boot path, guest agent checks, optional configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
               <li><strong>REST</strong> — Authenticated <code>/jobs</code>, <code>/vms</code>, <code>/migration-defaults</code>, etc.; public <code>/health</code> and <code>/version</code>.</li>
               <li><strong>Deploy</strong> — Docker Compose stack documented (API + worker + optional Redis); nginx reverse-proxy notes.</li>
             </ul>
+
+            <h4 id="help-import-permits">Import permits &amp; parallelism</h4>
+            <p>
+              The worker’s main throttle is <strong>Proxmox import-from</strong> (pulling the VMware disk). That is the
+              usual bottleneck for ESXi and the IO path, so permits apply <strong>during the disk import</strong>, not
+              for the whole migration.
+            </p>
+            <ul>
+              <li>
+                <strong>Bucket</strong> — Permit pool key. For PVE volids
+                <code>sh12:ha-datacenter/…/disk.vmdk</code> the bucket is <code>sh12</code>; for
+                <code>sh13:…</code> it is <code>sh13</code>. Different buckets ⇒ parallel import-from up to
+                <code>worker.max_concurrent_imports_per_esxi_storage</code> per bucket (typically <strong>1</strong>).
+              </li>
+              <li>
+                <strong>Same bucket</strong> — Two jobs both using <code>sh12:…</code> share one pool ⇒ import-from is
+                <strong>serialized</strong> for that storage id while others can still run on <code>sh13</code>.
+              </li>
+              <li>
+                <strong>Same VM</strong> — A second job for the same guest while one is still active is
+                <strong>rejected at enqueue</strong> (409), stricter than the permit alone.
+              </li>
+              <li>
+                <strong><code>esxi:…</code> paths</strong> — No <code>storage-id:</code> prefix; buckets use
+                <code>esxi:&lt;datacenter&gt;/&lt;datastore-or-folder&gt;</code> (see repo doc). Short paths fall back to
+                <code>esxi_legacy_uri</code>.
+              </li>
+              <li>
+                <strong>Optional merge</strong> — <code>worker.esxi_import_permit_bucket_override</code> maps several
+                computed buckets onto one Redis pool (e.g. same ESXi host behind two PVE storages). <strong>Omit it by
+                default</strong> so <code>sh12</code> and <code>sh13</code> stay independent and parallel.
+              </li>
+            </ul>
+            <p class="hint" style="margin-bottom: 0">
+              Full detail: <code>docs/import-permits-and-parallelism.md</code> in this repository.
+            </p>
 
             <h4 id="help-horizon">Horizon / guest automation (today)</h4>
             <p>
@@ -510,7 +624,7 @@
               <li><strong>Preflight / dry-run</strong> — Validate enqueue inputs without starting destructive work.</li>
               <li><strong>Job metadata</strong> — Pool / wave labels for reporting; richer audit trail.</li>
               <li><strong>Live logs</strong> — SSE or WebSocket if log volume grows; split cheap vs deep health checks.</li>
-              <li><strong>Config validation</strong> — Stricter schema at startup; optional <code>https_only</code> cookies when always behind TLS.</li>
+              <li><strong>HTTPS-only cookies</strong> — Optional <code>https_only</code> when always behind TLS.</li>
             </ul>
 
             <h4 id="help-security">Security considerations</h4>
@@ -533,7 +647,8 @@
             <h4 id="help-further-reading">Further reading</h4>
             <p class="hint" style="margin-bottom: 0">
               Repository files: <code>PRODUCT.md</code> (operator ideas), <code>DOCKER.md</code> / <code>NGINX.md</code>
-              (deploy), <code>docs/HORIZON_*.md</code> (Horizon resume / Connection Server notes). The version line above is
+              (deploy), <code>docs/import-permits-and-parallelism.md</code> (import-from buckets &amp; parallelism),
+              <code>docs/HORIZON_*.md</code> (Horizon resume / Connection Server notes). The version line above is
               loaded from <code>GET /version</code> (optional <code>MIGRATION_ENGINE_GIT_REVISION</code> env for build id).
             </p>
           </div>
@@ -547,6 +662,7 @@
         <div class="modal" role="dialog" aria-labelledby="migrate-modal-title">
           <h3 id="migrate-modal-title">Migrate to Proxmox</h3>
           <p class="hint" id="migrate-modal-summary"></p>
+          <div id="mig-prior-warning" class="banner warn hidden" style="margin-top: 0.5rem"></div>
           <p class="hint" id="mig-vmdk-hint"></p>
           <label for="mig-vmid-start">First Proxmox VM ID</label>
           <input id="mig-vmid-start" type="number" min="100" step="1" />
@@ -566,12 +682,21 @@
           <input id="mig-ram" type="number" min="512" step="256" />
           <label for="mig-cores">CPUs (cores)</label>
           <input id="mig-cores" type="number" min="1" max="256" step="1" />
+          <label style="margin-top: 0.5rem">Pre-boot snapshot</label>
+          <div class="inline">
+            <input type="radio" name="mig-take-snapshot" id="mig-snapshot-yes" value="yes" checked />
+            <label for="mig-snapshot-yes" style="margin: 0">Yes (recommended)</label>
+          </div>
+          <div class="inline" style="margin-top: 0.25rem">
+            <input type="radio" name="mig-take-snapshot" id="mig-snapshot-no" value="no" />
+            <label for="mig-snapshot-no" style="margin: 0">No (skip snapshot)</label>
+          </div>
           <div class="inline" style="margin-top: 0.75rem">
             <input type="checkbox" id="mig-enable-cpu-preset" />
             <label for="mig-enable-cpu-preset" style="margin: 0">Enable custom CPU via QEMU <code>args</code></label>
           </div>
           <p class="hint" id="mig-cpu-preset-hint" style="margin-top: 0.25rem">
-            Off: keep imported/template CPU config as-is. On: replace <code>cpu=</code> with preset <code>args</code> (requires root-capable args helper in Proxmox).
+            Off: apply default <code>cpu=host</code> (non-root path). On: use selected advanced preset via QEMU <code>args</code> (requires root-capable args helper in Proxmox).
           </p>
           <fieldset id="mig-cpu-preset-wrap" class="hidden" style="margin-top: 0.4rem; border: 0; padding: 0">
             <legend style="font-size: 0.9rem; margin-bottom: 0.35rem">CPU preset</legend>
@@ -734,6 +859,9 @@
       </p>
       </div>
     </main>
+    <footer class="app-footer" aria-label="Application version">
+      <span id="app-version-footer">Loading version…</span>
+    </footer>
   </div>
 
   <script>
@@ -897,7 +1025,7 @@
           srcInput.value.trim() +
           ". No import-from.";
         hSim.textContent =
-          "After clone, the worker moves the template OS disk from scsi0 to sata0, then runs the same SATA boot, driver check, and SATA→SCSI swap steps as a real import.";
+          "Clone workflow keeps the OS disk on scsi0 and runs the same direct-boot checks as a real import.";
       } else {
         srcWrap.classList.add("hidden");
         vmdkHint.textContent = lastVmdkHintText || vmdkHint.textContent;
@@ -917,13 +1045,34 @@
       "IMPORTING",
       "SATA_BOOT",
       "DRIVER_CHECK",
-      "SCSI_SWAP",
       "HORIZON_CONFIG",
       "COMPLETED",
     ];
     const JOBS_POLL_VISIBLE_MS = 5000;
     const JOBS_POLL_HIDDEN_MS = 20000;
-    const JOB_TIMELINE_SEQ = MIGRATION_STATES;
+    function stateLabel(name) {
+      if (name === "SATA_BOOT") return "PRE_BOOT_CHECK";
+      if (name === "SCSI_SWAP") return "SCSI_SWAP (legacy)";
+      if (name === "EFI_REDO") return "EFI_REDO";
+      return name;
+    }
+
+    function timelineSequenceFor(state, lastFailed) {
+      const seq = [...MIGRATION_STATES];
+      const s = String(state || "").trim();
+      const f = normalizedFailedStage(lastFailed);
+      if (s === "EFI_REDO" || f === "EFI_REDO") {
+        const i = seq.indexOf("HORIZON_CONFIG");
+        if (i >= 0) seq.splice(i, 0, "EFI_REDO");
+        else seq.push("EFI_REDO");
+      }
+      if (s === "SCSI_SWAP" || f === "SCSI_SWAP") {
+        const i = seq.indexOf("HORIZON_CONFIG");
+        if (i >= 0) seq.splice(i, 0, "SCSI_SWAP");
+        else seq.push("SCSI_SWAP");
+      }
+      return seq;
+    }
     let jobsPollTimer = null;
     const pendingJobSelection = new Set();
     let jobDetailJobId = null;
@@ -975,6 +1124,11 @@
     function migrationProgress(state) {
       if (!state) return { pct: 0, cls: "" };
       if (state === "FAILED" || state === "CANCELLED") return { pct: 100, cls: "fail" };
+      if (state === "SCSI_SWAP") {
+        const denom = MIGRATION_STATES.length - 1;
+        const i = Math.max(0, MIGRATION_STATES.indexOf("HORIZON_CONFIG") - 0.5);
+        return { pct: Math.round((i / denom) * 100), cls: "" };
+      }
       const i = MIGRATION_STATES.indexOf(state);
       if (i < 0) return { pct: 5, cls: "" };
       const denom = MIGRATION_STATES.length - 1;
@@ -1009,24 +1163,49 @@
       el.setAttribute("aria-hidden", open ? "false" : "true");
     }
 
+    function formatVersionLine(d) {
+      if (!d || typeof d !== "object") return "Version information unavailable.";
+      let s = "";
+      if (d.version) s = "Version " + d.version;
+      if (d.name) s = (s ? s + " · " : "") + d.name;
+      if (d.revision) s += " · build " + d.revision;
+      if (d.code_fingerprint) s += " · code " + d.code_fingerprint;
+      return s || "Version information unavailable.";
+    }
+
+    async function fetchVersionPayload() {
+      const r = await fetch("/version", {
+        credentials: "omit",
+        headers: { Accept: "application/json" },
+      });
+      return r.json().catch(() => ({}));
+    }
+
     async function refreshHelpVersion() {
       const el = document.getElementById("help-version-line");
       if (!el) return;
       el.textContent = "Loading version…";
       try {
-        const r = await fetch("/version", {
-          credentials: "omit",
-          headers: { Accept: "application/json" },
-        });
-        const d = await r.json().catch(() => ({}));
-        let s = "";
-        if (d.version) s = "Version " + d.version;
-        if (d.name) s = (s ? s + " · " : "") + d.name;
-        if (d.revision) s += " · build " + d.revision;
-        el.textContent = s || "Version information unavailable.";
+        const d = await fetchVersionPayload();
+        el.textContent = formatVersionLine(d);
       } catch (e) {
         el.textContent = "Version (could not load: " + (e.message || "?") + ")";
       }
+    }
+
+    async function refreshFooterVersion() {
+      let text = "Version information unavailable.";
+      try {
+        text = formatVersionLine(await fetchVersionPayload());
+      } catch (e) {
+        text = "Version (could not load)";
+      }
+      const a = document.getElementById("app-version-footer");
+      const b = document.getElementById("login-version-footer");
+      const c = document.getElementById("header-version-chip");
+      if (a) a.textContent = text;
+      if (b) b.textContent = text;
+      if (c) c.textContent = text;
     }
 
     function setHelpModal(open) {
@@ -1072,8 +1251,11 @@
     function jobDiagnosticsText(j) {
       if (!j) return "";
       const err = (j.error || "").trim();
+      const takeSnapshot =
+        j.take_snapshot === true ? "true" : j.take_snapshot === false ? "false" : "";
       return [
         "job_id: " + j.job_id,
+        "job_kind: " + (j.job_kind || "migration"),
         "vm_name: " + j.vm_name,
         "proxmox_node: " + (j.proxmox_node || ""),
         "proxmox_vmid: " + j.proxmox_vmid,
@@ -1082,6 +1264,16 @@
         "guest_ip: " + (j.guest_ip || ""),
         "updated_at: " + (j.updated_at || ""),
         "simulated_import: " + (j.simulated_import === true ? "true" : j.simulated_import === false ? "false" : ""),
+        "take_snapshot: " + takeSnapshot,
+        "vmware_api_host: " + (j.vmware_api_host || ""),
+        "import_mode: " + (j.import_mode || ""),
+        "vmdk_path_on_node: " + (j.vmdk_path_on_node || ""),
+        "import_serialization_bucket: " + (j.import_serialization_bucket || ""),
+        "import_permit_bucket: " + (j.import_permit_bucket || ""),
+        "import_permit_state: " + (j.import_permit_state || ""),
+        "import_activity_status: " + (j.import_activity_status || ""),
+        "import_parallelism_summary: " + (j.import_parallelism_summary || ""),
+        "import_parallelism_detail: " + (j.import_parallelism_detail || ""),
         err ? "error:\n" + err : "error:",
       ].join("\n");
     }
@@ -1094,7 +1286,7 @@
     }
 
     function renderJobTimeline(state, lastFailed) {
-      const seq = JOB_TIMELINE_SEQ;
+      const seq = timelineSequenceFor(state, lastFailed);
       const failBase = normalizedFailedStage(lastFailed);
       const failIdx = failBase ? seq.indexOf(failBase) : -1;
       const curIdx = state ? seq.indexOf(state) : -1;
@@ -1115,7 +1307,7 @@
           if (i < curIdx) cls = "job-tl-step done";
           else if (i === curIdx) cls = "job-tl-step current";
         }
-        parts.push('<span class="' + cls + '">' + escapeHtml(name) + "</span>");
+        parts.push('<span class="' + cls + '">' + escapeHtml(stateLabel(name)) + "</span>");
       }
       if (state === "CANCELLED") {
         parts.push('<span class="job-tl-step cancelled">' + escapeHtml("CANCELLED") + "</span>");
@@ -1163,14 +1355,23 @@
         jobDetailLastRecord = j;
         document.getElementById("job-detail-title").textContent = j.vm_name || "Migration job";
         document.getElementById("job-detail-subtitle").textContent = "Job " + j.job_id;
-        document.getElementById("job-detail-meta").textContent =
+        const snapshotLabel =
+          j.take_snapshot === true ? "yes" : j.take_snapshot === false ? "no" : "default(yes)";
+        const metaEl = document.getElementById("job-detail-meta");
+        const qsum = (j.import_activity_status || j.import_parallelism_summary || "").trim();
+        const qdet = (j.import_parallelism_detail || "").trim();
+        metaEl.textContent =
           "PVE VMID " +
           String(j.proxmox_vmid) +
           " · node " +
           (j.proxmox_node || "—") +
           " · state " +
           (j.state || "—") +
-          (j.updated_at ? " · updated " + String(j.updated_at).replace("T", " ").slice(0, 19) : "");
+          " · snapshot " +
+          snapshotLabel +
+          (j.updated_at ? " · updated " + String(j.updated_at).replace("T", " ").slice(0, 19) : "") +
+          (qsum ? " · " + qsum : "");
+        metaEl.title = qdet || "";
         document.getElementById("job-detail-timeline").innerHTML = renderJobTimeline(j.state, j.last_failed_stage);
         const err = (j.error || "").trim();
         if (err) {
@@ -1261,8 +1462,49 @@
         const jobs = await api("/jobs");
         jobs.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
         const pollNote = document.hidden ? " (background refresh ~20s)" : " (visible ~5s)";
+        const importing = jobs.filter((x) => x.state === "IMPORTING");
+        let importNow = "";
+        if (importing.length) {
+          const waitingCounts = new Map();
+          const runningCounts = new Map();
+          let runningNoBucket = 0;
+          for (const x of importing) {
+            const bucket = (x.import_permit_bucket || x.import_serialization_bucket || "").trim();
+            const st = (x.import_permit_state || "").trim().toUpperCase();
+            if (st === "WAITING" && bucket) {
+              waitingCounts.set(bucket, (waitingCounts.get(bucket) || 0) + 1);
+              continue;
+            }
+            if (st === "ACQUIRED" && bucket) {
+              runningCounts.set(bucket, (runningCounts.get(bucket) || 0) + 1);
+              continue;
+            }
+            if (bucket) {
+              runningCounts.set(bucket, (runningCounts.get(bucket) || 0) + 1);
+            } else {
+              runningNoBucket += 1;
+            }
+          }
+          const segs = [];
+          if (waitingCounts.size) {
+            segs.push(
+              "waiting " + [...waitingCounts.entries()].map(([k, n]) => k + "×" + n).join(", ")
+            );
+          }
+          if (runningCounts.size) {
+            segs.push(
+              "running " + [...runningCounts.entries()].map(([k, n]) => k + "×" + n).join(", ")
+            );
+          }
+          if (runningNoBucket > 0) segs.push("running no-bucket×" + runningNoBucket);
+          importNow = " · IMPORTING: " + segs.join(" · ");
+        }
         statusEl.textContent =
-          jobs.length + " job(s) · last refresh " + new Date().toLocaleTimeString() + pollNote;
+          jobs.length +
+          " job(s) · last refresh " +
+          new Date().toLocaleTimeString() +
+          pollNote +
+          importNow;
         if (!jobs.length) {
           table.hidden = true;
           empty.hidden = false;
@@ -1293,6 +1535,8 @@
           const stopTitle = terminal ? "Migration finished — stop is not available" : "Stop this migration";
           const isPending = j.state === "PENDING";
           const picked = pendingJobSelection.has(j.job_id);
+          const qsum = (j.import_activity_status || j.import_parallelism_summary || "").trim() || "—";
+          const qdet = (j.import_parallelism_detail || "").trim();
           const tr = document.createElement("tr");
           tr.innerHTML =
             '<td class="job-col-select"><input type="checkbox" class="job-pick" data-job-id="' +
@@ -1308,6 +1552,10 @@
             escapeHtml(String(j.proxmox_vmid)) +
             "</td><td>" +
             escapeHtml(j.proxmox_node || "") +
+            '</td><td class="job-import-queue-cell" title="' +
+            escapeAttr(qdet) +
+            '">' +
+            escapeHtml(qsum) +
             '</td><td><span class="state-pill">' +
             escapeHtml(j.state || "") +
             "</span></td><td>" +
@@ -1415,6 +1663,151 @@
       return [...document.querySelectorAll("#vm-tbody tr")].filter((tr) => tr.querySelector("input:checked")).map((tr) => tr.dataset.vmName);
     }
 
+    async function enqueueEfiRedoTagged() {
+      const gb = document.getElementById("global-banner");
+      const names = getSelectedVmNames();
+      const scope = names.length
+        ? names.length + " selected VM(s)"
+        : "all cluster VMs tagged migrated + efi-redo-pending";
+      if (
+        !confirm(
+          "Enqueue EFI redo workflow for " +
+            scope +
+            "?\n\n" +
+            "This workflow recreates efidisk0 and updates tags when done."
+        )
+      ) {
+        return;
+      }
+      const body = names.length ? { vm_names: names } : {};
+      try {
+        const res = await api("/jobs/efi-redo-pending", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        const cnt = Number(res.enqueued || 0);
+        if (cnt > 0) {
+          banner(
+            gb,
+            "ok",
+            "Enqueued " +
+              cnt +
+              " EFI redo job(s). Open the Migrations tab to monitor state/logs."
+          );
+        } else {
+          banner(
+            gb,
+            "info",
+            "No EFI redo jobs enqueued. No VMs matched the required tags."
+          );
+        }
+      } catch (e) {
+        banner(gb, "err", e.message || String(e));
+      }
+    }
+
+    function migrationPriorCell(vm) {
+      if (!vm) return { html: "—", title: "" };
+      if (vm.migration_active_state) {
+        const jid = vm.migration_active_job_id || "?";
+        return {
+          html: '<span class="vm-migration-active">' + escapeHtml("In progress") + "</span>",
+          title: "Active migration: " + vm.migration_active_state + " · job " + jid,
+        };
+      }
+      const st = vm.migration_last_terminal_state;
+      if (!st) return { html: "—", title: "" };
+      const jid = vm.migration_last_job_id || "?";
+      const at = String(vm.migration_last_terminal_at || "").replace("T", " ").slice(0, 19);
+      let label = st;
+      if (st === "COMPLETED") label = "Done";
+      else if (st === "FAILED") label = "Failed";
+      else if (st === "CANCELLED") label = "Cancelled";
+      let cls = "vm-migration-prior ";
+      if (st === "COMPLETED") cls += "vm-migration-ok";
+      else if (st === "FAILED") cls += "vm-migration-fail";
+      else cls += "vm-migration-cancel";
+      let title = st + " · job " + jid + (at ? " · " + at : "");
+      if (vm.migration_last_error_preview) title += " · " + vm.migration_last_error_preview;
+      return { html: '<span class="' + cls + '">' + escapeHtml(label) + "</span>", title: title };
+    }
+
+    function formatEsxiStorageIdsCell(vm) {
+      const ids = vm && vm.esxi_storage_ids;
+      if (Array.isArray(ids) && ids.length) return ids.join(", ");
+      return "—";
+    }
+
+    function formatListingSize(vm) {
+      const n = vm && vm.esxi_listing_size_bytes;
+      if (n == null || n === "" || !Number.isFinite(Number(n)) || Number(n) <= 0) return "—";
+      const b = Number(n);
+      const gb = b / Math.pow(1024, 3);
+      if (gb >= 1) return gb.toFixed(1) + " GiB";
+      const mb = b / Math.pow(1024, 2);
+      if (mb >= 1) return mb.toFixed(1) + " MiB";
+      const kb = b / 1024;
+      if (kb >= 1) return kb.toFixed(0) + " KiB";
+      return String(b) + " B";
+    }
+
+    function listingSizeTitle(vm) {
+      const n = vm && vm.esxi_listing_size_bytes;
+      if (n == null || n === "" || !Number.isFinite(Number(n)) || Number(n) <= 0) {
+        return "Size from Proxmox ESXi storage content listing when available (no file download).";
+      }
+      return (
+        "Proxmox listing size: " +
+        String(n) +
+        " bytes (metadata for the selected import candidate; not a full disk inspection)."
+      );
+    }
+
+    function esxiStorageIdsTitle(vm) {
+      const ids = vm && vm.esxi_storage_ids;
+      if (Array.isArray(ids) && ids.length) {
+        return (
+          "Proxmox ESXi-linked storage id(s) where this guest is listed: " +
+          ids.join(", ") +
+          ". For volid import paths (id:path/…), each id is a separate import permit bucket — migrate guests on different ids in parallel when possible."
+        );
+      }
+      const src = (vm && vm.inventory_source) || "";
+      if (src === "vcenter") {
+        return "Guest only in vCenter for this view — not listed on Proxmox ESXi storage on the configured node, so no PVE storage ids.";
+      }
+      return "";
+    }
+
+    function buildMigratePriorWarningLines(names) {
+      const inv = window.vmInventory || [];
+      const lines = [];
+      for (const name of names) {
+        const v = inv.find((x) => x.name === name);
+        if (!v) continue;
+        const segs = [];
+        if (v.migration_active_state) {
+          segs.push("active " + v.migration_active_state + " (job " + (v.migration_active_job_id || "?") + ")");
+        }
+        if (v.migration_last_terminal_state) {
+          segs.push(
+            "previous " +
+              v.migration_last_terminal_state +
+              " at " +
+              String(v.migration_last_terminal_at || "").replace("T", " ").slice(0, 19) +
+              " (job " +
+              (v.migration_last_job_id || "?") +
+              ")"
+          );
+        }
+        if (v.migration_last_error_preview && v.migration_last_terminal_state === "FAILED") {
+          segs.push("error: " + v.migration_last_error_preview);
+        }
+        if (segs.length) lines.push(name + ": " + segs.join("; ") + ".");
+      }
+      return lines;
+    }
+
     async function loadVmList() {
       const statusEl = document.getElementById("vm-list-status");
       const tbody = document.getElementById("vm-tbody");
@@ -1448,9 +1841,26 @@
           const mor = (vm.vmware_moref && String(vm.vmware_moref).trim()) ? String(vm.vmware_moref) : "—";
           const uuid = vm.uuid ? String(vm.uuid) : "—";
           const pwr = vm.power_state ? String(vm.power_state) : "—";
+          const mig = migrationPriorCell(vm);
+          const stIds = formatEsxiStorageIdsCell(vm);
+          const stTitle = esxiStorageIdsTitle(vm);
+          const sz = formatListingSize(vm);
+          const szTitle = listingSizeTitle(vm);
           tr.innerHTML =
             '<td><input type="checkbox" class="vm-cb" /></td><td>' +
             escapeHtml(vm.name) +
+            '</td><td class="vm-storage-cell" title="' +
+            escapeAttr(stTitle) +
+            '">' +
+            escapeHtml(stIds) +
+            '</td><td class="vm-storage-cell" title="' +
+            escapeAttr(szTitle) +
+            '">' +
+            escapeHtml(sz) +
+            '</td><td class="vm-migration-prior-cell" title="' +
+            escapeAttr(mig.title) +
+            '">' +
+            mig.html +
             "</td><td>" +
             escapeHtml(mor) +
             "</td><td>" +
@@ -1483,6 +1893,13 @@
       const el = document.getElementById("migrate-modal");
       el.classList.toggle("show", open);
       el.setAttribute("aria-hidden", open ? "false" : "true");
+      if (!open) {
+        const w = document.getElementById("mig-prior-warning");
+        if (w) {
+          w.classList.add("hidden");
+          w.textContent = "";
+        }
+      }
     }
 
     async function loadProxmoxStorageDropdown() {
@@ -1562,6 +1979,19 @@
       if (!names.length) return;
       document.getElementById("migrate-modal-summary").textContent =
         names.length + " VM(s): " + names.slice(0, 5).join(", ") + (names.length > 5 ? "…" : "");
+      const warnEl = document.getElementById("mig-prior-warning");
+      if (warnEl) {
+        const wl = buildMigratePriorWarningLines(names);
+        if (wl.length) {
+          warnEl.classList.remove("hidden");
+          warnEl.textContent =
+            "Notice — these guests already appear in migration history (you may still enqueue). " +
+            wl.join(" ");
+        } else {
+          warnEl.classList.add("hidden");
+          warnEl.textContent = "";
+        }
+      }
       const vmdkHint = document.getElementById("mig-vmdk-hint");
       document.getElementById("mig-storage-manual").value = "";
       let defStorage = "";
@@ -1573,8 +2003,8 @@
           : "/migration-defaults";
         const defs = await api(defsUrl);
         lastMigrationDefaults = defs;
-        document.getElementById("mig-ram").value = defs.memory_mb || 8192;
-        document.getElementById("mig-cores").value = defs.cores || 4;
+        document.getElementById("mig-ram").value = defs.memory_mb || 16384;
+        document.getElementById("mig-cores").value = defs.cores || 6;
         document.getElementById("mig-vlan").value =
           defs.vlan !== undefined && defs.vlan !== null && String(defs.vlan).trim() !== ""
             ? String(defs.vlan)
@@ -1640,8 +2070,8 @@
         }
       } catch (_) {
         lastMigrationDefaults = null;
-        document.getElementById("mig-ram").value = 8192;
-        document.getElementById("mig-cores").value = 4;
+        document.getElementById("mig-ram").value = 16384;
+        document.getElementById("mig-cores").value = 6;
         document.getElementById("mig-vlan").value = "";
         lastVmdkHintText =
           "Could not load migration defaults; check proxmox.vmdk_path_template (host path or esxi:…) before enqueueing.";
@@ -1660,6 +2090,10 @@
         });
         syncMigrateCpuPresetUi();
       }
+      const savedSnapshot = sessionStorage.getItem("migTakeSnapshot");
+      const takeSnapshot = savedSnapshot === null ? true : savedSnapshot !== "0";
+      document.getElementById("mig-snapshot-yes").checked = takeSnapshot;
+      document.getElementById("mig-snapshot-no").checked = !takeSnapshot;
       applyMigrateSimulatedToggle();
       await loadProxmoxStorageDropdown();
       preselectStorageFromDefault(defStorage);
@@ -1865,7 +2299,16 @@
         banner(gb, "ok", "VMware settings saved.");
         await loadCredentials();
       } catch (e) {
-        banner(gb, "err", e.message || String(e));
+        const msg = e.message || String(e);
+        if (msg.indexOf("Migration already in progress for:") >= 0) {
+          banner(
+            gb,
+            "info",
+            "Enqueue blocked: same VM already has an active migration. " + msg
+          );
+        } else {
+          banner(gb, "err", msg);
+        }
       }
     };
 
@@ -2064,6 +2507,7 @@
       });
     };
     document.getElementById("btn-open-migrate-modal").onclick = () => openMigrateModal();
+    document.getElementById("btn-enqueue-efi-redo").onclick = () => enqueueEfiRedoTagged();
     document.getElementById("mig-simulated").addEventListener("change", () => applyMigrateSimulatedToggle());
     document.getElementById("mig-enable-cpu-preset").addEventListener("change", () => syncMigrateCpuPresetUi());
     document.getElementById("mig-sim-source-vmid").addEventListener("input", () => {
@@ -2086,6 +2530,7 @@
       const vlan = vlanRaw === "" ? null : parseInt(vlanRaw, 10);
       const node = document.getElementById("mig-node").value.trim();
       const isSimulated = document.getElementById("mig-simulated").checked;
+      const takeSnapshot = !!document.getElementById("mig-snapshot-yes").checked;
       const simSourceRaw = document.getElementById("mig-sim-source-vmid").value.trim();
       const simSource = simSourceRaw ? parseInt(simSourceRaw, 10) : NaN;
       if (!names.length || !storage || !Number.isFinite(vmid) || vmid < 100 || !Number.isFinite(ram) || !Number.isFinite(cores)) {
@@ -2110,6 +2555,8 @@
         memory_mb: ram,
         cores: cores,
         simulated_import: isSimulated,
+        import_mode: "standard",
+        take_snapshot: takeSnapshot,
       };
       if (qemu_cpu_preset) body.qemu_cpu_preset = qemu_cpu_preset;
       if (isSimulated) body.simulated_clone_source_vmid = simSource;
@@ -2120,6 +2567,7 @@
         sessionStorage.setItem("migVmidStart", String(res.next_proxmox_vmid));
         sessionStorage.setItem("migSimulated", document.getElementById("mig-simulated").checked ? "1" : "0");
         sessionStorage.setItem("migCpuPreset", qemu_cpu_preset || "none");
+        sessionStorage.setItem("migTakeSnapshot", takeSnapshot ? "1" : "0");
         setMigrateModal(false);
         document.querySelectorAll("#vm-tbody input.vm-cb").forEach((cb) => {
           cb.checked = false;
@@ -2197,6 +2645,8 @@
 
     refreshHealthStrip();
     setInterval(refreshHealthStrip, HEALTH_POLL_MS);
+
+    refreshFooterVersion().catch(() => {});
 
     refreshAuth().catch(() => {
       show(document.getElementById("login-screen"), true);

@@ -37,4 +37,6 @@ redis:
   job_key_prefix: "migration:test:job:"
   job_log_suffix: ":log"
 worker:
+  max_concurrent_imports_per_esxi_storage: 2
+  job_thread_pool_size: 8
   max_concurrent_imports: 1

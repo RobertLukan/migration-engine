@@ -1,0 +1,22 @@
+# Test image for self-hosted CI (Docker / Portainer). No app secrets: uses tests/fixtures/minimal_config.yaml.
+# Build: docker build -f Dockerfile.ci -t migration-engine-ci:latest .
+# Run:  docker run --rm migration-engine-ci:latest
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MIGRATION_ENGINE_CONFIG=/app/tests/fixtures/minimal_config.yaml
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+COPY . .
+
+CMD ["pytest", "-q", "--tb=short"]

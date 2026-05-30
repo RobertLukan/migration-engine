@@ -61,6 +61,8 @@ services:
     # volumes:
     #   - ./config.docker.yaml:/app/config.docker.yaml:ro
 
+  # v2.0+: run multiple workers for parallel jobs; ESXi import concurrency is capped per storage id in Redis
+  # (see worker.max_concurrent_imports_per_esxi_storage). Example: docker compose up -d --scale worker=4
   worker:
     image: migration-engine:latest
     platform: linux/amd64
