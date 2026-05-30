@@ -52,6 +52,7 @@ Use this quick map when you need to find CPU controls:
 
 - **Config path (cluster/environment level):**
   - `config.yaml` -> `proxmox.args_helper_*` credentials for root-capable `args=` writes.
+  - `config.yaml` -> optional `proxmox.cpu_presets` map to override advanced preset `-cpu ...` strings per environment/hardware.
   - `config.yaml` -> default Proxmox target settings (`proxmox.*`) used by jobs.
 
 - **Code path (for administrators/developers changing preset definitions):**

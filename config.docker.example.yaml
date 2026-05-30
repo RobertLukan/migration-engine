@@ -24,6 +24,11 @@ proxmox:
   # args_helper_password: "CHANGE_ME"
   # args_helper_token_id: "root@pam!migration-args"
   # args_helper_token_secret: "CHANGE_ME"
+  # Optional: override built-in advanced CPU preset args without code edits.
+  # Keys must match known presets used by UI/API.
+  # cpu_presets:
+  #   host_no_nested: "-cpu host,-vmx"
+  #   host_nested_vbs: "-cpu host,+vmx,..."
   storage: local-lvm
   bridge: vmbr0
   vlan: ""

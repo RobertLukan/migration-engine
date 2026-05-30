@@ -533,9 +533,32 @@ QEMU_CPU_PRESET_ARGS: dict[str, str] = {
 }
 
 
-def _qemu_cpu_preset_from_job(raw: str | None) -> str | None:
+def _qemu_cpu_preset_args_map(cfg: dict[str, Any]) -> dict[str, str]:
+    """
+    CPU preset args map used by worker.
+    Default values live in code; admins can override known presets via:
+      proxmox.cpu_presets.<preset_key>: "-cpu ..."
+    Unknown keys are ignored for safety.
+    """
+    out = dict(QEMU_CPU_PRESET_ARGS)
+    px = cfg.get("proxmox") or {}
+    raw = px.get("cpu_presets")
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        kk = str(k or "").strip()
+        if kk not in out:
+            continue
+        sv = str(v or "").strip()
+        if not sv:
+            continue
+        out[kk] = sv
+    return out
+
+
+def _qemu_cpu_preset_from_job(raw: str | None, cfg: dict[str, Any]) -> str | None:
     k = (raw or "").strip()
-    return k if k in QEMU_CPU_PRESET_ARGS else None
+    return k if k in _qemu_cpu_preset_args_map(cfg) else None
 
 
 def _apply_qemu_cpu_preset_to_guest(
@@ -551,7 +574,17 @@ def _apply_qemu_cpu_preset_to_guest(
     cancel_poll: tuple[redis.Redis, dict[str, Any], str, str] | None,
 ) -> None:
     """Remove PVE cpu= and set qemu args= to a fixed -cpu host,… profile (not expressible as cpu: alone)."""
-    args_val = QEMU_CPU_PRESET_ARGS[preset_key]
+    args_map = _qemu_cpu_preset_args_map(cfg)
+    args_val = args_map[preset_key]
+    if args_val != QEMU_CPU_PRESET_ARGS.get(preset_key):
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            stage,
+            f"using custom cpu preset args from config for {preset_key!r}",
+        )
     helper = connect_proxmox_args_helper(cfg)
     proxmox_for_args = helper or proxmox
     cfg_now = get_qemu_config(proxmox, node, vmid)
@@ -1350,7 +1383,7 @@ def stage_sata_boot_extras(
         pre_first_boot_guest_resources,
     )
 
-    preset_key = _qemu_cpu_preset_from_job(qemu_cpu_preset)
+    preset_key = _qemu_cpu_preset_from_job(qemu_cpu_preset, cfg)
     if preset_key:
 
         def qemu_custom_cpu_args() -> None:
