@@ -7,6 +7,10 @@ VMware -> Proxmox migration orchestrator (API/UI + worker + Redis queue).
 This project was created primarily to assist migration of **Windows 11 VDI** workloads.
 It can also be used for migration of recent **Windows Server** guests.
 
+## Screenshot
+
+![Migration Engine UI](docs/img/pic1.png)
+
 ## Prerequisites
 
 This automation assumes Windows guests are prepared before migration:
