@@ -6,10 +6,13 @@ Dashboard UI: session password auth, credential editing, connection tests.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import uuid
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -31,8 +34,21 @@ from worker import (
     allocate_sequential_free_vmids,
     connect_proxmox,
     mark_job_cancelled_operator,
+    qemu_vmids_in_use_cluster,
     qemu_vmids_in_use_on_node,
+    resolve_esxi_import_permit_bucket,
 )
+
+try:
+    from config_validate import validate_loaded_config
+except ModuleNotFoundError:
+    # Backward-compatibility fallback for old runtime bundles; keep app bootable.
+    def validate_loaded_config(data: Any) -> dict[str, Any]:
+        if data is None:
+            raise ValueError("config file is empty")
+        if not isinstance(data, dict):
+            raise TypeError(f"config root must be a mapping, got {type(data).__name__}")
+        return data
 
 _cfg_path_override = (os.environ.get("MIGRATION_ENGINE_CONFIG") or "").strip()
 CONFIG_PATH = (
@@ -45,9 +61,40 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 ui_module.CONFIG_PATH = CONFIG_PATH
 
 
+@lru_cache(maxsize=1)
+def _runtime_code_fingerprint() -> str:
+    """
+    Short SHA-256 fingerprint of key runtime files for operator-visible build identity.
+    Helps verify the running code matches expected deployment even when semantic version is unchanged.
+    """
+    root = Path(__file__).resolve().parent
+    files = (
+        "main.py",
+        "worker.py",
+        "ui.py",
+        "states.py",
+        "config_validate.py",
+        "static/index.html",
+    )
+    h = hashlib.sha256()
+    for rel in files:
+        p = root / rel
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            h.update(p.read_bytes())
+        except Exception:
+            h.update(b"<missing>")
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
 def load_config() -> dict[str, Any]:
     with CONFIG_PATH.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    if raw is None:
+        raise ValueError(f"config file is empty: {CONFIG_PATH}")
+    return validate_loaded_config(raw)
 
 
 def redis_client() -> redis.Redis:
@@ -311,6 +358,13 @@ class CreateJobRequest(BaseModel):
         default=None,
         description="If true, clone proxmox.simulated_clone_source_vmid instead of VMware import; None uses config default",
     )
+    preimported_disk_mode: bool = Field(
+        default=False,
+        description=(
+            "If true, skip VMware/ESXi import-from. Expects VM shell with this VMID already exists on Proxmox "
+            "and OS disk was attached/imported manually (e.g. qm importdisk)."
+        ),
+    )
     simulated_clone_source_vmid: int | None = Field(
         default=None,
         ge=100,
@@ -323,8 +377,12 @@ class CreateJobRequest(BaseModel):
         default=None,
         description=(
             "Clears PVE cpu= and sets qemu args to a fixed -cpu host profile (nested/VBS variants). "
-            "None leaves CPU as after import/clone."
+            "None applies default cpu=host via non-root VM config path."
         ),
+    )
+    take_snapshot: bool = Field(
+        default=True,
+        description="If true, create a pre-boot snapshot before first guest startup checks.",
     )
 
 
@@ -344,6 +402,18 @@ class MigrateSelectedRequest(BaseModel):
         default=None,
         description="If true, clone template VM on Proxmox instead of VMware disk import; None uses config default",
     )
+    import_mode: Literal["standard", "nfs"] = Field(
+        default="standard",
+        description=(
+            "Disk source mode for non-simulated jobs: "
+            "'standard' uses proxmox.vmdk_path_template/auto-esxi behavior, "
+            "'nfs' uses nfs_vmdk_path_template from request."
+        ),
+    )
+    nfs_vmdk_path_template: str | None = Field(
+        default=None,
+        description="Required when import_mode='nfs'; include {vm_name} placeholder.",
+    )
     simulated_clone_source_vmid: int | None = Field(
         default=None,
         ge=100,
@@ -354,7 +424,34 @@ class MigrateSelectedRequest(BaseModel):
     )
     qemu_cpu_preset: Literal["host_no_nested", "host_nested_vbs"] | None = Field(
         default=None,
-        description="Custom qemu -cpu via args=; None leaves template/import CPU settings.",
+        description="Custom qemu -cpu via args=; None applies default cpu=host (non-root path).",
+    )
+    take_snapshot: bool = Field(
+        default=True,
+        description="If true, create a pre-boot snapshot before first guest startup checks.",
+    )
+
+
+class EfiRedoEnqueueRequest(BaseModel):
+    """
+    Enqueue EFI-redo workflow for migrated VMs that still carry the pending tag.
+    If vm_names is omitted, all matching tagged QEMU VMs in the cluster are targeted.
+    """
+
+    vm_names: list[str] | None = Field(default=None, description="Optional subset by VM name")
+    proxmox_storage: str | None = Field(
+        default=None,
+        description="Storage for newly recreated efidisk0; default from proxmox.storage",
+    )
+    run_guest_script: bool = Field(
+        default=False,
+        description="Run proxmox.efi_redo_guest_script via WinRM before EFI disk recreation.",
+    )
+    winrm_user: str = Field(default="Administrator")
+    winrm_password: str = Field(default="")
+    guest_script_override: str | None = Field(
+        default=None,
+        description="Optional PowerShell content override instead of proxmox.efi_redo_guest_script.",
     )
 
 
@@ -376,8 +473,19 @@ class JobRecord(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     simulated_import: bool | None = None
+    preimported_disk_mode: bool | None = None
     simulated_clone_source_vmid: int | None = None
     qemu_cpu_preset: str | None = None
+    take_snapshot: bool | None = None
+    import_mode: str | None = None
+    vmware_api_host: str | None = None
+    import_serialization_bucket: str | None = None
+    import_parallelism_summary: str | None = None
+    import_parallelism_detail: str | None = None
+    import_permit_state: str | None = None
+    import_permit_bucket: str | None = None
+    import_activity_status: str | None = None
+    job_kind: str | None = None
 
 
 class VCenterEnqueueFilters(BaseModel):
@@ -402,7 +510,7 @@ if not _session_secret:
         "config.yaml must define ui.session_secret (random string) and ui.password (dashboard password)"
     )
 
-app = FastAPI(title="VMware → Proxmox migration orchestrator", version="1.0.0")
+app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.0.0")
 app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret,
@@ -412,6 +520,197 @@ app.add_middleware(
 )
 
 api = APIRouter(dependencies=[Depends(require_ui_session)])
+
+_TERMINAL_JOB_STATES = frozenset(
+    {
+        MigrationState.COMPLETED.value,
+        MigrationState.FAILED.value,
+        MigrationState.CANCELLED.value,
+    }
+)
+
+
+def _iter_job_record_raw(r: redis.Redis, cfg: dict[str, Any]) -> Iterator[dict[str, str]]:
+    """Yield raw job hashes (excluding log list keys)."""
+    prefix = cfg["redis"]["job_key_prefix"]
+    log_suffix = cfg["redis"]["job_log_suffix"]
+    for key in r.scan_iter(f"{prefix}*", count=100):
+        if key.endswith(log_suffix):
+            continue
+        data = r.hgetall(key)
+        if not data or not data.get("job_id"):
+            continue
+        yield data
+
+
+def _job_row_sort_ts(data: dict[str, str]) -> str:
+    return (data.get("updated_at") or data.get("created_at") or "").strip()
+
+
+def _active_migration_index_by_vm_name(
+    r: redis.Redis, cfg: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    """
+    Latest non-terminal job by VM name (lowercased key).
+    Used to block concurrent migration of the same VM.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for data in _iter_job_record_raw(r, cfg):
+        vm = (data.get("vm_name") or "").strip()
+        st = (data.get("state") or "").strip()
+        if not vm or not st or st in _TERMINAL_JOB_STATES:
+            continue
+        lk = vm.lower()
+        prev = out.get(lk)
+        if prev is None or _job_row_sort_ts(data) >= _job_row_sort_ts(prev):
+            out[lk] = data
+    return out
+
+
+def _assert_no_active_migration_for_vm_names(
+    names: list[str],
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    active_by_lower: dict[str, dict[str, str]] | None = None,
+) -> dict[str, dict[str, str]]:
+    idx = active_by_lower if active_by_lower is not None else _active_migration_index_by_vm_name(r, cfg)
+    blocked: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        nm = (raw or "").strip()
+        if not nm:
+            continue
+        lk = nm.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        j = idx.get(lk)
+        if not j:
+            continue
+        jst = (j.get("state") or "").strip() or "UNKNOWN"
+        jid = (j.get("job_id") or "").strip() or "?"
+        blocked.append(f"{nm} ({jst}, job {jid})")
+    if blocked:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Migration already in progress for: "
+                + ", ".join(blocked)
+                + ". Wait until the active job reaches COMPLETED, FAILED, or CANCELLED."
+            ),
+        )
+    return idx
+
+
+def _normalize_pve_tags(raw: Any) -> list[str]:
+    out: list[str] = []
+    if raw is None:
+        return out
+    if isinstance(raw, (list, tuple, set)):
+        vals = [str(x or "").strip() for x in raw]
+    else:
+        vals = [x for x in str(raw).replace(",", ";").replace(" ", ";").split(";")]
+    seen: set[str] = set()
+    for v in vals:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+def _cluster_tagged_qemu_rows(
+    proxmox: Any, *, required_tags_lower: set[str]
+) -> list[dict[str, Any]]:
+    raw: Any = proxmox.cluster.resources.get(type="vm")
+    rows: list[Any]
+    if isinstance(raw, list):
+        rows = raw
+    elif isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        rows = raw["data"]
+    else:
+        rows = []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        typ = str(row.get("type") or "").strip().lower()
+        if typ and typ != "qemu":
+            continue
+        vmid_raw = row.get("vmid")
+        node = str(row.get("node") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if vmid_raw is None or not node:
+            continue
+        try:
+            vmid = int(vmid_raw)
+        except (TypeError, ValueError):
+            continue
+        tags = _normalize_pve_tags(row.get("tags"))
+        lower = {t.lower() for t in tags}
+        if required_tags_lower and not required_tags_lower.issubset(lower):
+            continue
+        out.append(
+            {
+                "vmid": vmid,
+                "node": node,
+                "name": name or f"vm-{vmid}",
+                "tags": tags,
+            }
+        )
+    return out
+
+
+def _merge_migration_history_into_vm_rows(
+    rows: list[dict[str, Any]], r: redis.Redis, cfg: dict[str, Any]
+) -> None:
+    """
+    Attach prior / active migration hints per guest name (case-insensitive match to job vm_name).
+
+    Fields on each row (only when applicable):
+    - migration_active_state, migration_active_job_id — newest non-terminal job
+    - migration_last_terminal_state, migration_last_terminal_at, migration_last_job_id
+    - migration_last_error_preview — short text when last terminal was FAILED
+    """
+    by_lower: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for data in _iter_job_record_raw(r, cfg):
+        vm = (data.get("vm_name") or "").strip()
+        if not vm:
+            continue
+        by_lower[vm.lower()].append(data)
+
+    for row in rows:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        jobs = by_lower.get(name.lower(), [])
+        if not jobs:
+            continue
+        jobs_sorted = sorted(jobs, key=_job_row_sort_ts, reverse=True)
+        for j in jobs_sorted:
+            st = (j.get("state") or "").strip()
+            if st and st not in _TERMINAL_JOB_STATES:
+                row["migration_active_state"] = st
+                row["migration_active_job_id"] = j.get("job_id", "")
+                break
+        for j in jobs_sorted:
+            st = (j.get("state") or "").strip()
+            if st in _TERMINAL_JOB_STATES:
+                row["migration_last_terminal_state"] = st
+                row["migration_last_terminal_at"] = (
+                    (j.get("updated_at") or j.get("created_at") or "").strip()
+                )
+                row["migration_last_job_id"] = j.get("job_id", "")
+                err = (j.get("error") or "").strip()
+                if err:
+                    row["migration_last_error_preview"] = (
+                        err[:160] + ("…" if len(err) > 160 else "")
+                    )
+                break
 
 
 def _vm_inventory_merge(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -445,6 +744,9 @@ def _vm_inventory_merge(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                     by_lower[lk] = {
                         **s,
                         "inventory_source": "vcenter",
+                        "esxi_storage_ids": [],
+                        "esxi_import_uri": None,
+                        "esxi_listing_size_bytes": None,
                     }
         return sorted(by_lower.values(), key=lambda x: x["name"].lower())
     except Exception:
@@ -454,7 +756,13 @@ def _vm_inventory_merge(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 @api.get("/vms")
 def list_vms_for_migrate() -> list[dict[str, Any]]:
     cfg = load_config()
-    return _vm_inventory_merge(cfg)
+    rows = _vm_inventory_merge(cfg)
+    try:
+        r = redis_client()
+        _merge_migration_history_into_vm_rows(rows, r, cfg)
+    except Exception:
+        pass
+    return rows
 
 
 def _migration_default_net_mtu(px: dict[str, Any]) -> int:
@@ -473,8 +781,8 @@ def migration_defaults(proxmox_node: str | None = None) -> dict[str, Any]:
     tmpl = (p.get("vmdk_path_template") or "").strip()
     out: dict[str, Any] = {
         "storage": p.get("storage", "local-lvm"),
-        "memory_mb": int(p.get("memory_mb", 8192)),
-        "cores": int(p.get("cores", 4)),
+        "memory_mb": int(p.get("memory_mb", 16384)),
+        "cores": int(p.get("cores", 6)),
         "default_node": p.get("default_node", ""),
         "bridge": p.get("bridge", "vmbr0"),
         "vlan": p.get("vlan", ""),
@@ -502,7 +810,7 @@ def migration_defaults(proxmox_node: str | None = None) -> dict[str, Any]:
     nod = (proxmox_node or p.get("default_node") or "").strip()
     if nod:
         try:
-            used = qemu_vmids_in_use_on_node(connect_proxmox(cfg), nod)
+            used = qemu_vmids_in_use_cluster(connect_proxmox(cfg))
             vmin = out.get("migration_vmid_min")
             vmax = out.get("migration_vmid_max")
             if used:
@@ -524,6 +832,7 @@ def migration_defaults(proxmox_node: str | None = None) -> dict[str, Any]:
 def create_job(body: CreateJobRequest) -> JobRecord:
     cfg = load_config()
     r = redis_client()
+    _assert_no_active_migration_for_vm_names([body.vm_name], r, cfg)
     job_id = str(uuid.uuid4())
     node = body.proxmox_node or cfg["proxmox"]["default_node"]
     if not node or not str(node).strip():
@@ -535,9 +844,14 @@ def create_job(body: CreateJobRequest) -> JobRecord:
     use_simulated = body.simulated_import
     if use_simulated is None:
         use_simulated = bool(px.get("simulated_import", False))
+    use_preimported = bool(body.preimported_disk_mode)
+    if use_preimported and use_simulated:
+        raise HTTPException(status_code=400, detail="preimported_disk_mode and simulated_import cannot both be true")
     template = (px.get("vmdk_path_template") or "").strip()
     vmdk = (body.vmdk_path_on_node or "").strip()
-    if use_simulated:
+    if use_preimported:
+        vmdk = "preimported:manual"
+    elif use_simulated:
         vmdk = vmdk or "simulated:clone"
     elif not vmdk:
         if not template:
@@ -564,22 +878,40 @@ def create_job(body: CreateJobRequest) -> JobRecord:
 
     nod = str(node).strip()
     try:
-        used_now = qemu_vmids_in_use_on_node(connect_proxmox(cfg), nod)
+        px_api = connect_proxmox(cfg)
+        used_cluster = qemu_vmids_in_use_cluster(px_api)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot verify Proxmox VM ID on node {nod!r}: {exc}",
+            detail=f"Cannot verify Proxmox VM IDs in cluster: {exc}",
         ) from exc
-    if int(body.proxmox_vmid) in used_now:
-        alt_ids, _ = allocate_sequential_free_vmids(set(used_now), int(body.proxmox_vmid), 1)
-        alt = alt_ids[0]
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Proxmox VM ID {body.proxmox_vmid} is already in use on node {nod!r}. "
-                f"Retry with proxmox_vmid={alt} (next free from your requested ID)."
-            ),
-        )
+    if use_preimported:
+        try:
+            used_on_node = qemu_vmids_in_use_on_node(px_api, nod)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot verify existing VMIDs on Proxmox node {nod!r}: {exc}",
+            ) from exc
+        if int(body.proxmox_vmid) not in used_on_node:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"preimported_disk_mode=true requires an existing VM on node {nod!r}; "
+                    f"VMID {body.proxmox_vmid} was not found."
+                ),
+            )
+    else:
+        if int(body.proxmox_vmid) in used_cluster:
+            alt_ids, _ = allocate_sequential_free_vmids(set(used_cluster), int(body.proxmox_vmid), 1)
+            alt = alt_ids[0]
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Proxmox VM ID {body.proxmox_vmid} is already in use in this cluster. "
+                    f"Retry with proxmox_vmid={alt} (next free from your requested ID)."
+                ),
+            )
 
     now = utc_now_iso()
     mapping: dict[str, str] = {
@@ -606,6 +938,8 @@ def create_job(body: CreateJobRequest) -> JobRecord:
     if body.vlan is not None and str(body.vlan).strip() != "":
         mapping["vlan"] = str(body.vlan).strip()
     mapping["simulated_import"] = "1" if use_simulated else "0"
+    mapping["preimported_disk_mode"] = "1" if use_preimported else "0"
+    mapping["take_snapshot"] = "1" if body.take_snapshot else "0"
     if use_simulated and body.simulated_clone_source_vmid is not None:
         mapping["simulated_clone_source_vmid"] = str(int(body.simulated_clone_source_vmid))
     if body.qemu_cpu_preset is not None:
@@ -613,7 +947,7 @@ def create_job(body: CreateJobRequest) -> JobRecord:
     key = job_key(cfg, job_id)
     r.hset(key, mapping=mapping)
     r.rpush(cfg["redis"]["queue_key"], job_id)
-    return _hash_to_record(r.hgetall(key))
+    return _job_record_for_api(cfg, r.hgetall(key))
 
 
 @api.post("/jobs/migrate-selected")
@@ -624,12 +958,26 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     use_simulated = body.simulated_import
     if use_simulated is None:
         use_simulated = bool(px.get("simulated_import", False))
+    import_mode = body.import_mode
     template = (px.get("vmdk_path_template") or "").strip()
-    if not use_simulated and not template:
-        raise HTTPException(
-            status_code=400,
-            detail="Set proxmox.vmdk_path_template in config.yaml (auto-esxi, or /imports/{vm_name}.vmdk, or esxi:DC/.../{vm_name}/...), or enable simulated import",
-        )
+    nfs_template = (body.nfs_vmdk_path_template or "").strip()
+    if not use_simulated:
+        if import_mode == "nfs":
+            if not nfs_template:
+                raise HTTPException(
+                    status_code=400,
+                    detail="import_mode='nfs' requires nfs_vmdk_path_template",
+                )
+            if "{vm_name}" not in nfs_template:
+                raise HTTPException(
+                    status_code=400,
+                    detail="nfs_vmdk_path_template must include '{vm_name}' placeholder",
+                )
+        elif not template:
+            raise HTTPException(
+                status_code=400,
+                detail="Set proxmox.vmdk_path_template in config.yaml (auto-esxi, or /imports/{vm_name}.vmdk, or esxi:DC/.../{vm_name}/...), or enable simulated import",
+            )
     node = body.proxmox_node or px.get("default_node")
     if not node:
         raise HTTPException(status_code=400, detail="proxmox.default_node or proxmox_node is required")
@@ -638,23 +986,25 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     seen: set[str] = set()
     for raw in body.vm_names:
         name = raw.strip()
-        if not name or name in seen:
+        lk = name.lower()
+        if not name or lk in seen:
             continue
-        seen.add(name)
+        seen.add(lk)
         ordered.append(name)
     if not ordered:
         raise HTTPException(status_code=400, detail="No valid VM names after deduplication")
+    active_by_lower = _assert_no_active_migration_for_vm_names(ordered, r, cfg)
 
     job_ids: list[str] = []
     storage = body.proxmox_storage.strip()
     node_str = str(node).strip()
     proxmox = connect_proxmox(cfg)
     try:
-        in_use = qemu_vmids_in_use_on_node(proxmox, node_str)
+        in_use = qemu_vmids_in_use_cluster(proxmox)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot list QEMU guests on Proxmox node {node_str!r}: {exc}",
+            detail=f"Cannot list QEMU VMIDs in Proxmox cluster: {exc}",
         ) from exc
     slot = set(in_use)
     try:
@@ -675,7 +1025,7 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    auto_esxi = template.lower() in _AUTO_ESXI_TEMPLATES
+    auto_esxi = import_mode == "standard" and template.lower() in _AUTO_ESXI_TEMPLATES
     pve_rows_enum = ui_module.enumerate_guests_from_pve_esxi(cfg, node_str)
     pve_name_keys = {r["name"].lower() for r in pve_rows_enum}
     pve_uri_by_name: dict[str, str] = {}
@@ -718,7 +1068,11 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
             "created_at": now,
             "updated_at": now,
             "simulated_import": "1" if use_simulated else "0",
+            "import_mode": import_mode,
+            "take_snapshot": "1" if body.take_snapshot else "0",
         }
+        if import_mode == "nfs" and nfs_template:
+            mapping["nfs_vmdk_path_template"] = nfs_template
         if body.vlan is not None and str(body.vlan).strip() != "":
             mapping["vlan"] = str(body.vlan).strip()
         if use_simulated and body.simulated_clone_source_vmid is not None:
@@ -728,6 +1082,13 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
         key = job_key(cfg, job_id)
         r.hset(key, mapping=mapping)
         r.rpush(cfg["redis"]["queue_key"], job_id)
+        active_by_lower[name.lower()] = {
+            "job_id": job_id,
+            "vm_name": name,
+            "state": MigrationState.PENDING.value,
+            "created_at": now,
+            "updated_at": now,
+        }
         job_ids.append(job_id)
 
     def _validate_names_against_pve_esxi() -> None:
@@ -762,6 +1123,23 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
         _validate_names_against_pve_esxi()
         for name, vid in zip(ordered, allocated_ids, strict=True):
             enqueue_one(name, "simulated:clone", vid)
+        return {
+            "enqueued": len(job_ids),
+            "job_ids": job_ids,
+            "next_proxmox_vmid": next_proxmox_vmid,
+            **_ms_extra,
+        }
+
+    if import_mode == "nfs":
+        for name, vid in zip(ordered, allocated_ids, strict=True):
+            try:
+                vmdk = nfs_template.format(vm_name=name)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid nfs_vmdk_path_template for {name!r}: {exc}",
+                ) from exc
+            enqueue_one(name, vmdk, vid)
         return {
             "enqueued": len(job_ids),
             "job_ids": job_ids,
@@ -842,6 +1220,100 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     }
 
 
+@api.post("/jobs/efi-redo-pending")
+def enqueue_efi_redo_pending(body: EfiRedoEnqueueRequest) -> dict[str, Any]:
+    cfg = load_config()
+    r = redis_client()
+    px = cfg.get("proxmox") or {}
+    pending_tag = str(px.get("efi_redo_pending_tag") or "efi-redo-pending").strip().lower()
+    migrated_tag = str(px.get("efi_redo_migrated_tag") or "migrated").strip().lower()
+    required = {t for t in (pending_tag, migrated_tag) if t}
+    if pending_tag == "":
+        raise HTTPException(status_code=400, detail="proxmox.efi_redo_pending_tag cannot be empty")
+
+    proxmox = connect_proxmox(cfg)
+    try:
+        tagged = _cluster_tagged_qemu_rows(proxmox, required_tags_lower=required)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot list tagged QEMU guests in Proxmox cluster: {exc}",
+        ) from exc
+
+    selected: list[dict[str, Any]] = tagged
+    if body.vm_names:
+        wanted = {x.strip().lower() for x in body.vm_names if x and x.strip()}
+        if not wanted:
+            raise HTTPException(status_code=400, detail="vm_names provided but empty after normalization")
+        selected = [x for x in tagged if x["name"].lower() in wanted]
+        misses = sorted(wanted.difference({x["name"].lower() for x in selected}))
+        if misses:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Some vm_names are missing required tags "
+                    f"({migrated_tag} + {pending_tag}) or do not exist: {misses}"
+                ),
+            )
+    if not selected:
+        return {"enqueued": 0, "job_ids": [], "matched": 0, "required_tags": sorted(required)}
+
+    vm_names = [x["name"] for x in selected]
+    active_by_lower = _assert_no_active_migration_for_vm_names(vm_names, r, cfg)
+    store = (body.proxmox_storage or px.get("storage") or "").strip() or "local-lvm"
+    try:
+        for row in selected:
+            validate_job_vmid_and_storage(cfg, int(row["vmid"]), store)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job_ids: list[str] = []
+    for row in selected:
+        job_id = str(uuid.uuid4())
+        now = utc_now_iso()
+        mapping: dict[str, str] = {
+            "job_id": job_id,
+            "job_kind": "efi_redo",
+            "state": MigrationState.PENDING.value,
+            "vm_name": row["name"],
+            "proxmox_vmid": str(int(row["vmid"])),
+            "proxmox_node": row["node"],
+            "vmdk_path_on_node": "efi-redo:tagged",
+            "proxmox_storage": store,
+            "winrm_user": body.winrm_user,
+            "winrm_password": body.winrm_password,
+            "guest_ip": "",
+            "error": "",
+            "last_failed_stage": "",
+            "created_at": now,
+            "updated_at": now,
+            "simulated_import": "0",
+            "preimported_disk_mode": "0",
+            "take_snapshot": "0",
+            "run_guest_script": "1" if body.run_guest_script else "0",
+        }
+        if body.guest_script_override is not None:
+            mapping["efi_redo_guest_script_override"] = body.guest_script_override
+        key = job_key(cfg, job_id)
+        r.hset(key, mapping=mapping)
+        r.rpush(cfg["redis"]["queue_key"], job_id)
+        active_by_lower[row["name"].lower()] = {
+            "job_id": job_id,
+            "vm_name": row["name"],
+            "state": MigrationState.PENDING.value,
+            "created_at": now,
+            "updated_at": now,
+        }
+        job_ids.append(job_id)
+
+    return {
+        "enqueued": len(job_ids),
+        "job_ids": job_ids,
+        "matched": len(selected),
+        "required_tags": sorted(required),
+    }
+
+
 @api.post("/jobs/enqueue-from-vcenter")
 def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
     cfg = load_config()
@@ -851,6 +1323,7 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
             detail="enqueue-from-vcenter requires VMware (vCenter) credentials in config.yaml",
         )
     r = redis_client()
+    active_by_lower = _active_migration_index_by_vm_name(r, cfg)
     names_set = set(body.names) if body.names else None
     prefix = body.name_prefix
     node = body.proxmox_node or cfg["proxmox"]["default_node"]
@@ -858,11 +1331,11 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
     node_str = str(node).strip()
     proxmox = connect_proxmox(cfg)
     try:
-        vcenter_slot = qemu_vmids_in_use_on_node(proxmox, node_str)
+        vcenter_slot = qemu_vmids_in_use_cluster(proxmox)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot list QEMU guests on Proxmox node {node_str!r}: {exc}",
+            detail=f"Cannot list QEMU VMIDs in Proxmox cluster: {exc}",
         ) from exc
     cursor = int(body.proxmox_vmid_start)
     px_vc = cfg.get("proxmox") or {}
@@ -875,6 +1348,7 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
                 continue
             if prefix is not None and not vm.name.startswith(prefix):
                 continue
+            _assert_no_active_migration_for_vm_names([vm.name], r, cfg, active_by_lower)
 
             ids, cursor = allocate_sequential_free_vmids(vcenter_slot, cursor, 1)
             vmid = ids[0]
@@ -920,6 +1394,13 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
             key = job_key(cfg, job_id)
             r.hset(key, mapping=mapping)
             r.rpush(cfg["redis"]["queue_key"], job_id)
+            active_by_lower[vm.name.lower()] = {
+                "job_id": job_id,
+                "vm_name": vm.name,
+                "state": MigrationState.PENDING.value,
+                "created_at": now,
+                "updated_at": now,
+            }
             job_ids.append(job_id)
 
     return {"enqueued": len(job_ids), "job_ids": job_ids}
@@ -933,7 +1414,7 @@ def get_job(job_id: str) -> JobRecord:
     data = r.hgetall(key)
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _hash_to_record(data)
+    return _job_record_for_api(cfg, data)
 
 
 @api.post("/jobs/{job_id}/stop", response_model=JobRecord)
@@ -951,7 +1432,7 @@ def stop_job(job_id: str) -> JobRecord:
         state = MigrationState.PENDING
     if state in (MigrationState.COMPLETED, MigrationState.FAILED, MigrationState.CANCELLED):
         r.hdel(key, "cancel_requested")
-        return _hash_to_record(data)
+        return _job_record_for_api(cfg, data)
 
     pipe = r.pipeline(transaction=True)
     pipe.hset(key, "cancel_requested", "1")
@@ -963,22 +1444,16 @@ def stop_job(job_id: str) -> JobRecord:
     if removed > 0 and data.get("state") == MigrationState.PENDING.value:
         mark_job_cancelled_operator(r, cfg, job_id, stage="PENDING")
 
-    return _hash_to_record(r.hgetall(key))
+    return _job_record_for_api(cfg, r.hgetall(key))
 
 
 @api.get("/jobs")
 def list_jobs(state: str | None = None) -> list[JobRecord]:
     cfg = load_config()
     r = redis_client()
-    prefix = cfg["redis"]["job_key_prefix"]
     out: list[JobRecord] = []
-    for key in r.scan_iter(f"{prefix}*", count=100):
-        if key.endswith(cfg["redis"]["job_log_suffix"]):
-            continue
-        data = r.hgetall(key)
-        if not data:
-            continue
-        rec = _hash_to_record(data)
+    for data in _iter_job_record_raw(r, cfg):
+        rec = _job_record_for_api(cfg, data)
         if state is None or rec.state == state:
             out.append(rec)
     return sorted(out, key=lambda j: j.created_at or "")
@@ -1012,6 +1487,122 @@ def _parse_job_bool_field(raw: str | None) -> bool | None:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _job_parallelism_api_fields(
+    cfg: dict[str, Any], data: dict[str, str], rec: JobRecord
+) -> dict[str, Any]:
+    """UI hints: VMware endpoint, import path, and worker import-permit bucket (parallelism)."""
+    if (data.get("job_kind") or "").strip().lower() == "efi_redo":
+        return {
+            "vmware_api_host": None,
+            "import_serialization_bucket": None,
+            "import_parallelism_summary": "EFI redo workflow",
+            "import_parallelism_detail": "Post-migration EFI redo workflow for tagged VMs.",
+            "import_permit_state": None,
+            "import_permit_bucket": None,
+            "import_activity_status": "EFI redo queued/running",
+        }
+    vmdk = (data.get("vmdk_path_on_node") or "").strip()
+    sim = rec.simulated_import is True
+    pre = rec.preimported_disk_mode is True
+    wcfg = cfg.get("worker") or {}
+    try:
+        mc = int(wcfg.get("max_concurrent_imports_per_esxi_storage", 1) or 1)
+    except (TypeError, ValueError):
+        mc = 1
+    mc = max(1, mc)
+    vmware_h = str((cfg.get("vmware") or {}).get("host") or "").strip() or None
+
+    bucket: str | None = None
+    if not sim and not pre:
+        bucket = resolve_esxi_import_permit_bucket(cfg, vmdk)
+    permit_state = (data.get("import_permit_state") or "").strip().upper() or None
+
+    if sim:
+        summary = "Simulated clone"
+    elif pre:
+        summary = "Preimported disk"
+    elif bucket == "esxi_legacy_uri":
+        summary = f"VMware URI pool · ≤{mc} concurrent"
+    elif bucket and str(bucket).lower().startswith("esxi:"):
+        summary = f"ESXi URI bucket {bucket} · ≤{mc} concurrent"
+    elif bucket:
+        summary = f"PVE ESXi store {bucket} · ≤{mc} concurrent"
+    else:
+        summary = "No storage queue (parallel)"
+
+    activity: str | None = None
+    if rec.state == MigrationState.IMPORTING.value:
+        if permit_state == "WAITING" and bucket:
+            activity = f"Waiting: bucket {bucket} is busy"
+        elif permit_state == "ACQUIRED" and bucket:
+            activity = f"Import running: bucket {bucket}"
+        elif bucket:
+            activity = f"Import stage: bucket {bucket}"
+        else:
+            activity = "Import running (no bucket serialization)"
+    elif permit_state == "RELEASED" and bucket:
+        activity = f"Import permit released: bucket {bucket}"
+
+    parts: list[str] = []
+    if vmware_h:
+        parts.append(f"vCenter/ESXi API host: {vmware_h}")
+    pn = (data.get("proxmox_node") or "").strip()
+    pvm = (data.get("proxmox_vmid") or "").strip()
+    parts.append(f"Proxmox target: node {pn or '—'} · VMID {pvm or '—'}")
+    if vmdk:
+        vd = vmdk if len(vmdk) <= 220 else vmdk[:217] + "…"
+        parts.append(f"Import path: {vd}")
+    im = (data.get("import_mode") or "").strip()
+    if im:
+        parts.append(f"import_mode {im}")
+    if sim:
+        parts.append("Simulated: Proxmox clone only; no VMware import-from permit.")
+    elif pre:
+        parts.append("Preimported: attach existing disk; no VMware import-from permit.")
+    elif permit_state == "WAITING" and bucket:
+        parts.append(f"Current queue state: waiting for ESXi import permit on bucket {bucket}.")
+    elif permit_state == "ACQUIRED" and bucket:
+        parts.append(f"Current queue state: import permit acquired on bucket {bucket} (disk import running).")
+    elif permit_state == "RELEASED" and bucket:
+        parts.append(f"Current queue state: permit released for bucket {bucket} (import step finished).")
+    elif bucket == "esxi_legacy_uri":
+        parts.append(
+            f"Legacy esxi:… URIs share one global permit pool (cap {mc}); only that many "
+            "VMware import-from operations at once across all workers. "
+            "Permit is held only for the disk pull, not the full migration."
+        )
+    elif bucket and str(bucket).lower().startswith("esxi:"):
+        parts.append(
+            f"``esxi:…`` import paths are bucketed by datacenter + datastore segment ({bucket}); "
+            f"jobs sharing this bucket are limited to {mc} concurrent import-from operations. "
+            "Use PVE volids ``<pve-esxi-storage-id>:…`` if you need one permit pool per linked Proxmox ESXi storage id."
+        )
+    elif bucket:
+        parts.append(
+            f"Same PVE ESXi linked-storage id ⇒ same permit bucket (cap {mc}). "
+            "Matching bucket names in the jobs list share that limit. "
+            "The permit applies only while Proxmox runs import-from (disk pull), not for the whole job — "
+            "other stages (boot, disk move, Horizon, etc.) can overlap between VMs."
+        )
+    else:
+        parts.append(
+            "This path is not gated by the worker’s per–ESXi-storage permit. "
+            "Multiple jobs may import in parallel unless VMware or Proxmox limits apply elsewhere. "
+            "If you expected a bucket here, check import path shape (needs PVE volid like storageid:…/… or storageid:….vmdk) "
+            f"and worker.max_concurrent_imports_per_esxi_storage (currently {mc})."
+        )
+    detail = " ".join(parts)
+    return {
+        "vmware_api_host": vmware_h,
+        "import_serialization_bucket": bucket,
+        "import_parallelism_summary": summary,
+        "import_parallelism_detail": detail,
+        "import_permit_state": permit_state,
+        "import_permit_bucket": bucket,
+        "import_activity_status": activity,
+    }
+
+
 def _hash_to_record(data: dict[str, str]) -> JobRecord:
     return JobRecord(
         job_id=data["job_id"],
@@ -1031,9 +1622,20 @@ def _hash_to_record(data: dict[str, str]) -> JobRecord:
         created_at=data.get("created_at") or None,
         updated_at=data.get("updated_at") or None,
         simulated_import=_parse_job_bool_field(data.get("simulated_import")),
+        preimported_disk_mode=_parse_job_bool_field(data.get("preimported_disk_mode")),
         simulated_clone_source_vmid=_optional_int(data, "simulated_clone_source_vmid"),
         qemu_cpu_preset=(data.get("qemu_cpu_preset") or "").strip() or None,
+        take_snapshot=_parse_job_bool_field(data.get("take_snapshot")),
+        import_mode=(data.get("import_mode") or "").strip() or None,
+        import_permit_state=(data.get("import_permit_state") or "").strip() or None,
+        import_permit_bucket=(data.get("import_permit_bucket") or "").strip() or None,
+        job_kind=(data.get("job_kind") or "").strip() or None,
     )
+
+
+def _job_record_for_api(cfg: dict[str, Any], data: dict[str, str]) -> JobRecord:
+    rec = _hash_to_record(data)
+    return rec.model_copy(update=_job_parallelism_api_fields(cfg, data, rec))
 
 
 @app.get("/health")
@@ -1093,7 +1695,11 @@ def app_version() -> dict[str, str]:
     Public build metadata for the dashboard Help panel and operators.
     Optional: set ``MIGRATION_ENGINE_GIT_REVISION`` in the environment (e.g. CI / Docker build arg).
     """
-    out: dict[str, str] = {"name": app.title, "version": app.version}
+    out: dict[str, str] = {
+        "name": app.title,
+        "version": app.version,
+        "code_fingerprint": _runtime_code_fingerprint(),
+    }
     rev = (os.environ.get("MIGRATION_ENGINE_GIT_REVISION") or "").strip()
     if rev:
         out["revision"] = rev

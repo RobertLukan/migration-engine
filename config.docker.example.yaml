@@ -13,6 +13,7 @@ vmware:
 proxmox:
   host: "10.0.0.2"
   port: 8006
+  api_timeout_sec: 30
   verify_ssl: false
   default_node: pve
   api_token_id: root@pam!migration
@@ -33,8 +34,8 @@ proxmox:
   bridge: vmbr0
   vlan: ""
   net_mtu: 1500
-  memory_mb: 8192
-  cores: 4
+  memory_mb: 16384
+  cores: 6
   ostype: win10
   vmdk_path_template: auto-esxi
   simulated_import: true
@@ -43,6 +44,16 @@ proxmox:
   efi_tpm_disk_format: raw
   efidisk0: ""
   import_disk_format: raw
+  # Tags applied to completed migrated VMs for operator follow-up tracking.
+  # Unset => defaults to "migrated;efi-redo-pending". Set to empty to disable.
+  # post_migrate_tags: "migrated;efi-redo-pending"
+  # EFI redo workflow tags (used by POST /jobs/efi-redo-pending).
+  # efi_redo_pending_tag: "efi-redo-pending"
+  # efi_redo_migrated_tag: "migrated"
+  # efi_redo_done_tag: "efi-redo-done"
+  # Optional PowerShell run inside guest before EFI disk recreation:
+  # efi_redo_guest_script: |
+  #   Write-Host "EFI prep steps here"
   # Production-style safety (see main config.yaml). For local Docker lab, leave commented or
   # match the VMIDs you enqueue. Ceph: use Proxmox storage id here, not only the Ceph pool name.
   # safety:
@@ -57,6 +68,15 @@ redis:
   job_key_prefix: "migration:job:"
   job_log_suffix: :log
 worker:
+  # SIGTERM/SIGINT: stop dequeuing, re-queue job if popped but not started, drain in-flight work (see README).
+  max_concurrent_imports_per_esxi_storage: 1
+  # Optional (OFF by default): merge permit buckets only when you explicitly set this map.
+  # If omitted, each PVE ESXi storage id (e.g. sh12 vs sh13) keeps its own pool — imports can run in parallel.
+  # Use only when several storages funnel through the same ESXi host and you need one shared cap:
+  # esxi_import_permit_bucket_override:
+  #   sh12: esx-host-dc1
+  #   sh13: esx-host-dc1
+  job_thread_pool_size: 24
   max_concurrent_imports: 3
   guest_agent_poll_interval_sec: 5
   guest_agent_ip_timeout_sec: 1800

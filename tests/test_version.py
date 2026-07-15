@@ -10,3 +10,6 @@ def test_version_public(main_module):
     data = r.json()
     assert data.get("version")
     assert data.get("name")
+    fp = data.get("code_fingerprint")
+    assert isinstance(fp, str)
+    assert len(fp) == 12

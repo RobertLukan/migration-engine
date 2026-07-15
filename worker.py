@@ -1,8 +1,11 @@
 """
-Redis-driven migration worker: Proxmox import + SATA first-boot (with a small SCSI scratch disk),
-grace shutdown, SATA→SCSI disk move, second-boot guest-agent wait. Horizon/WinRM guest automation
-is optional and commonly kept as a placeholder hook for future workflows.
-Max concurrent VMDK imports enforced with a semaphore; hardware steps wrapped with Redis error logging.
+Redis-driven migration worker: Proxmox import directly to SCSI boot disk, first-boot guest-agent
+check, optional Horizon via WinRM (see RUN_HORIZON_WINRM_STAGE).
+Process **SIGTERM** / **SIGINT**: stop dequeuing, re-queue a popped job if not yet started, then drain the thread pool.
+
+v2.0+: concurrent imports across worker threads / replicas are limited per **Proxmox ESXi storage id**
+(``max_concurrent_imports_per_esxi_storage``, Redis token pools) so one ESXi datastore is not overloaded.
+Roll back to v1.x images/code for the previous in-process global semaphore behaviour.
 """
 
 from __future__ import annotations
@@ -11,11 +14,13 @@ import json
 import logging
 import os
 import re
+import signal
+import socket
 import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -25,7 +30,7 @@ import winrm
 import yaml
 from proxmoxer import ProxmoxAPI
 
-from pve_safety import validate_job_vmid_and_storage, validate_scratch_purge_volume
+from pve_safety import validate_job_vmid_and_storage
 from states import MigrationState
 
 _cfg_path_override = (os.environ.get("MIGRATION_ENGINE_CONFIG") or "").strip()
@@ -48,8 +53,21 @@ class MigrationAborted(Exception):
 
 
 def load_config() -> dict[str, Any]:
+    try:
+        from config_validate import validate_loaded_config
+    except ModuleNotFoundError:
+        def validate_loaded_config(data: Any) -> dict[str, Any]:
+            if data is None:
+                raise ValueError("config file is empty")
+            if not isinstance(data, dict):
+                raise TypeError(f"config root must be a mapping, got {type(data).__name__}")
+            return data
+
     with CONFIG_PATH.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    if raw is None:
+        raise ValueError(f"config file is empty: {CONFIG_PATH}")
+    return validate_loaded_config(raw)
 
 
 def qemu_vmids_in_use_on_node(proxmox: ProxmoxAPI, node: str) -> set[int]:
@@ -65,6 +83,33 @@ def qemu_vmids_in_use_on_node(proxmox: ProxmoxAPI, node: str) -> set[int]:
     out: set[int] = set()
     for row in rows:
         if not isinstance(row, dict):
+            continue
+        vid = row.get("vmid")
+        if vid is None:
+            continue
+        try:
+            out.add(int(vid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def qemu_vmids_in_use_cluster(proxmox: ProxmoxAPI) -> set[int]:
+    """Cluster-wide VMIDs for QEMU guests (all nodes)."""
+    raw: Any = proxmox.cluster.resources.get(type="vm")
+    rows: list[Any]
+    if isinstance(raw, list):
+        rows = raw
+    elif isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        rows = raw["data"]
+    else:
+        return set()
+    out: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        typ = str(row.get("type") or "").strip().lower()
+        if typ and typ != "qemu":
             continue
         vid = row.get("vmid")
         if vid is None:
@@ -103,6 +148,11 @@ def allocate_sequential_free_vmids(
 
 def connect_proxmox(cfg: dict[str, Any]) -> ProxmoxAPI:
     p = cfg["proxmox"]
+    try:
+        api_timeout = int(p.get("api_timeout_sec", 30))
+    except (TypeError, ValueError):
+        api_timeout = 30
+    api_timeout = max(5, api_timeout)
     token_id = (p.get("api_token_id") or "").strip()
     token_secret = (p.get("api_token_secret") or "").strip()
     if token_id and token_secret:
@@ -121,6 +171,7 @@ def connect_proxmox(cfg: dict[str, Any]) -> ProxmoxAPI:
             token_value=token_secret,
             port=int(p.get("port", 8006)),
             verify_ssl=bool(p.get("verify_ssl", True)),
+            timeout=api_timeout,
         )
     user = (p.get("user") or "").strip()
     password = (p.get("password") or "").strip()
@@ -132,6 +183,7 @@ def connect_proxmox(cfg: dict[str, Any]) -> ProxmoxAPI:
         password=password,
         port=int(p.get("port", 8006)),
         verify_ssl=bool(p.get("verify_ssl", True)),
+        timeout=api_timeout,
     )
 
 
@@ -146,6 +198,11 @@ def connect_proxmox_args_helper(cfg: dict[str, Any]) -> ProxmoxAPI | None:
     If not configured, returns ``None`` and the normal proxmox client is used.
     """
     p = cfg.get("proxmox") or {}
+    try:
+        api_timeout = int(p.get("api_timeout_sec", 30))
+    except (TypeError, ValueError):
+        api_timeout = 30
+    api_timeout = max(5, api_timeout)
     token_id = (p.get("args_helper_token_id") or "").strip()
     token_secret = (p.get("args_helper_token_secret") or "").strip()
     if token_id and token_secret:
@@ -164,6 +221,7 @@ def connect_proxmox_args_helper(cfg: dict[str, Any]) -> ProxmoxAPI | None:
             token_value=token_secret,
             port=int(p.get("port", 8006)),
             verify_ssl=bool(p.get("verify_ssl", True)),
+            timeout=api_timeout,
         )
 
     user = (p.get("args_helper_user") or "").strip()
@@ -175,6 +233,7 @@ def connect_proxmox_args_helper(cfg: dict[str, Any]) -> ProxmoxAPI | None:
             password=password,
             port=int(p.get("port", 8006)),
             verify_ssl=bool(p.get("verify_ssl", True)),
+            timeout=api_timeout,
         )
     return None
 
@@ -185,6 +244,163 @@ def job_key(cfg: dict[str, Any], job_id: str) -> str:
 
 def job_log_key(cfg: dict[str, Any], job_id: str) -> str:
     return f"{job_key(cfg, job_id)}{cfg['redis']['job_log_suffix']}"
+
+
+def _sanitize_import_bucket_fragment(s: str, max_len: int = 96) -> str:
+    out: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in "-_.":
+            out.append(ch)
+        else:
+            out.append("_")
+    r = "".join(out).strip("._-")
+    return (r or "x")[:max_len]
+
+
+def esxi_import_concurrency_bucket(vmdk_path: str) -> str | None:
+    """
+    Redis import-permit pools are keyed by this bucket.
+
+    Proxmox ESXi ``import-from`` volids look like ``<pve-storage-id>:dc/.../disk.vmdk``; concurrent
+    reads for the same PVE ESXi storage id stress the same ESXi side, so we serialize (or cap) per id.
+
+    Some listings use ``<pve-storage-id>:file.vmdk`` without path segments; we still bucket on the
+    storage id when the tail looks like a disk descriptor.
+
+    Host/NFS paths (no ``storageid:…`` pattern) return None — no ESXi-side permit (parallel OK).
+    """
+    p = (vmdk_path or "").strip()
+    if not p:
+        return None
+    low = p.lower()
+    if low.startswith("simulated:") or low.startswith("preimported:"):
+        return None
+    if low.startswith("http://") or low.startswith("https://"):
+        return None
+    if low.startswith("esxi:"):
+        # Proxmox ``esxi:…`` URIs do not carry the PVE storage-id prefix, so we cannot reuse the
+        # ``<pve-storage-id>:…`` bucket scheme. Serialize per datacenter + first path segment (usually
+        # datastore / folder root in inventory) so two VMs on the same ESXi-side tree share a pool,
+        # while unrelated ``esxi:`` trees can still run in parallel.
+        tail = p[5:].strip().strip("/")
+        parts = [x for x in tail.split("/") if x]
+        if len(parts) >= 2:
+            return f"esxi:{parts[0]}/{parts[1]}".lower()
+        return "esxi_legacy_uri"
+    if "\\" in p:
+        return None
+    sid, sep, tail = p.partition(":")
+    if not sep:
+        return None
+    sid = sid.strip()
+    tail = tail.strip()
+    if not sid or not tail:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", sid):
+        return None
+    tlow = tail.lower()
+    path_like = "/" in tail
+    vol_like = tlow.endswith(".vmdk") or tlow.endswith(".vmx")
+    if not path_like and not vol_like:
+        return None
+    return sid
+
+
+def apply_esxi_import_permit_bucket_override(cfg: dict[str, Any], bucket: str | None) -> str | None:
+    """
+    Map the computed permit bucket onto an operator-defined key (e.g. ESXi host id).
+
+    Use when the real limit is **per ESXi host**, while Proxmox exposes multiple linked storages
+    (``sh12:…``, ``sh13:…``) that still funnel through the same host.
+    """
+    if not bucket:
+        return None
+    wcfg = cfg.get("worker") or {}
+    ov = wcfg.get("esxi_import_permit_bucket_override")
+    if not isinstance(ov, dict):
+        return bucket
+    if bucket in ov:
+        v = ov[bucket]
+    else:
+        lk = bucket.lower()
+        v = next((ov[k] for k in ov if isinstance(k, str) and k.lower() == lk), None)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return bucket
+
+
+def resolve_esxi_import_permit_bucket(cfg: dict[str, Any], vmdk_path: str) -> str | None:
+    """Computed import permit bucket after optional ``worker.esxi_import_permit_bucket_override``."""
+    return apply_esxi_import_permit_bucket_override(cfg, esxi_import_concurrency_bucket(vmdk_path))
+
+
+def _import_permit_redis_keys(cfg: dict[str, Any], bucket: str) -> tuple[str, str, str]:
+    wcfg = cfg.get("worker") or {}
+    base = (wcfg.get("import_permit_prefix") or "migration:import_permit:").strip()
+    if not base.endswith(":"):
+        base = base + ":"
+    safe = _sanitize_import_bucket_fragment(bucket)
+    q = f"{base}q:{safe}"
+    size_k = f"{base}size:{safe}"
+    lock_k = f"{base}lock:{safe}"
+    return q, size_k, lock_k
+
+
+def ensure_esxi_import_permit_pool(
+    r: redis.Redis, cfg: dict[str, Any], bucket: str, want: int
+) -> str:
+    """Create or resize a token list so ``want`` permits exist (best-effort, lock-protected)."""
+    q, size_k, lock_k = _import_permit_redis_keys(cfg, bucket)
+    want = max(1, int(want))
+    for _ in range(240):
+        cur = r.get(size_k)
+        ln = int(r.llen(q) or 0)
+        # ``ln > want`` means extra permit tokens (double release, manual edits, or old pool state)
+        # and would allow more than ``want`` concurrent imports — rebuild.
+        if cur is not None and int(cur) == want and ln <= want:
+            return q
+        if r.set(lock_k, "1", nx=True, ex=20):
+            try:
+                pipe = r.pipeline()
+                pipe.delete(q)
+                for _i in range(want):
+                    pipe.rpush(q, "1")
+                pipe.set(size_k, str(want))
+                pipe.execute()
+            finally:
+                r.delete(lock_k)
+            return q
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Timed out initializing ESXi import permit pool for bucket {bucket!r} (key {q!r})"
+    )
+
+
+def acquire_esxi_import_permit(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    list_key: str,
+    job_id: str,
+    stage: str,
+) -> None:
+    wcfg = cfg.get("worker") or {}
+    try:
+        wait_max = int(wcfg.get("esxi_import_permit_wait_sec", 604800))
+    except (TypeError, ValueError):
+        wait_max = 604800
+    deadline = time.monotonic() + max(60, wait_max)
+    while time.monotonic() < deadline:
+        check_job_cancelled(r, cfg, job_id, stage)
+        popped = r.brpop(list_key, timeout=2)
+        if popped:
+            return
+    raise TimeoutError(
+        f"Timed out waiting for ESXi import permit on {list_key!r} after {wait_max}s"
+    )
+
+
+def release_esxi_import_permit(r: redis.Redis, list_key: str) -> None:
+    r.rpush(list_key, "1")
 
 
 def utc_now_iso() -> str:
@@ -265,6 +481,36 @@ def set_state(
     r.hset(key, mapping=mapping)
 
 
+def set_import_permit_status(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    job_id: str,
+    *,
+    bucket: str | None,
+    permit_state: str,
+) -> None:
+    """
+    Persist queue/permit hints for UI:
+    - WAITING: job is blocked on bucket permit
+    - ACQUIRED: job owns permit, import-from is running
+    - NONE: import path has no bucket serialization
+    - RELEASED: permit was released after import step
+    """
+    key = job_key(cfg, job_id)
+    mapping: dict[str, str] = {
+        "import_permit_state": str(permit_state).strip().upper(),
+        "import_permit_updated_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
+    }
+    b = (bucket or "").strip()
+    if b:
+        mapping["import_permit_bucket"] = b
+    else:
+        # Keep key present but empty so UI knows bucket is intentionally absent.
+        mapping["import_permit_bucket"] = ""
+    r.hset(key, mapping=mapping)
+
+
 def fail_job(
     r: redis.Redis,
     cfg: dict[str, Any],
@@ -317,6 +563,11 @@ def task_upid_from_response(resp: Any) -> str | None:
             d = resp.get(key)
             if isinstance(d, str) and d.startswith("UPID:"):
                 return d
+            if isinstance(d, dict):
+                for inner in ("upid", "UPID", "task_id"):
+                    v = d.get(inner)
+                    if isinstance(v, str) and v.startswith("UPID:"):
+                        return v
     return None
 
 
@@ -389,7 +640,102 @@ def get_qemu_config(proxmox: ProxmoxAPI, node: str, vmid: int) -> dict[str, Any]
     return dict(proxmox.nodes(node).qemu(vmid).config.get())
 
 
-PRE_SCSI_SWAP_SNAPSHOT = "pre_scsi_swap"
+def _qemu_list_rows(proxmox: ProxmoxAPI, node: str) -> list[Any]:
+    raw: Any = proxmox.nodes(node).qemu.get()
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        return raw["data"]
+    return []
+
+
+def _qemu_cluster_lock_hint(proxmox: ProxmoxAPI, node: str, vmid: int) -> str | None:
+    for row in _qemu_list_rows(proxmox, node):
+        if not isinstance(row, dict):
+            continue
+        try:
+            if int(row.get("vmid", 0)) != int(vmid):
+                continue
+        except (TypeError, ValueError):
+            continue
+        lock = row.get("lock")
+        if lock:
+            s = str(lock).strip()
+            return s or None
+    return None
+
+
+def wait_proxmox_disk_import_quiescent(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    job_id: str,
+    stage: str,
+    proxmox: ProxmoxAPI,
+    node: str,
+    vmid: int,
+    resp: Any,
+    *,
+    cancel_poll: tuple[redis.Redis, dict[str, Any], str, str] | None,
+) -> None:
+    """
+    ``import-from`` can keep reading from ESXi after ``config.post`` returns. Some PVE builds omit
+    a task UPID in the API response, so ``wait_if_async`` returns immediately while the copy still
+    runs — which would release our Redis ESXi import permit too early and allow overlapping imports
+    from the same bucket. Wait until the VM is not locked and the OS disk line (``scsi0`` in current
+    flow; legacy ``sata0`` in older jobs) no longer contains
+    ``import-from`` (stable across two polls when no UPID was seen).
+    """
+    had_upid = bool(task_upid_from_response(resp))
+    poll = float((cfg.get("worker") or {}).get("task_poll_interval_sec", 2))
+    deadline = time.monotonic() + 86400
+    idle_streak = 0
+    warned = False
+    while time.monotonic() < deadline:
+        if cancel_poll is not None:
+            cr, ccfg, jid, stg = cancel_poll
+            check_job_cancelled(cr, ccfg, jid, stg)
+        cfg_now = get_qemu_config(proxmox, node, vmid)
+        disk_line = (cfg_now.get("scsi0") or cfg_now.get("sata0") or "").strip()
+        if not disk_line:
+            idle_streak = 0
+            time.sleep(poll)
+            continue
+        list_lock = _qemu_cluster_lock_hint(proxmox, node, vmid)
+        try:
+            st = proxmox.nodes(node).qemu(vmid).status.current.get()
+            status_lock = (st.get("lock") or "").strip() if isinstance(st, dict) else ""
+        except Exception:
+            status_lock = ""
+        cfg_lock = str(cfg_now.get("lock") or "").strip()
+        import_tail = "import-from" in disk_line.lower()
+        busy = bool(list_lock or status_lock or cfg_lock or import_tail)
+        if not busy:
+            idle_streak += 1
+        else:
+            idle_streak = 0
+        need_idle = 1 if had_upid else 2
+        if idle_streak >= need_idle:
+            return
+        if not warned and not had_upid:
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                stage,
+                "Proxmox import-from had no task UPID in the API response; "
+                "waiting until VM locks clear and scsi0/sata0 no longer references import-from "
+                "before releasing the ESXi import permit.",
+            )
+            warned = True
+        time.sleep(poll)
+    raise TimeoutError(
+        f"Timed out waiting for qemu/{vmid} on node {node!r} to finish import-from "
+        "(VM lock or import-from still present after 24h)."
+    )
+
+
+PRE_BOOT_SNAPSHOT = "pre_boot"
 
 
 def _qemu_snapshot_names(proxmox: ProxmoxAPI, node: str, vmid: int) -> set[str]:
@@ -408,91 +754,6 @@ def _qemu_snapshot_names(proxmox: ProxmoxAPI, node: str, vmid: int) -> set[str]:
             if isinstance(n, str) and n:
                 out.add(n)
     return out
-
-
-def _volume_indices_on_storage(cfg_qemu: dict[str, Any], storage_id: str) -> set[int]:
-    """
-    Collect numeric volume indices already used on ``storage_id`` (``STORAGE:N`` or
-    ``STORAGE:vm-*-disk-N`` in any disk/efidisk/tpm field). Used to avoid reusing ``:0`` after
-    ``sata0=data15_nvme:0,import-from=…`` which breaks LVM-thin with ``virtualsize may not be zero``.
-    """
-    sid = (storage_id or "").strip()
-    if not sid:
-        return set()
-    found: set[int] = set()
-    digit_prefix = re.compile(re.escape(sid) + r":(\d+)(?:,|$)", re.IGNORECASE)
-    vm_disk = re.compile(re.escape(sid) + r":vm-\d+-disk-(\d+)(?:,|$)", re.IGNORECASE)
-    for val in cfg_qemu.values():
-        if not isinstance(val, str):
-            continue
-        first = val.strip().split(",")[0].strip()
-        m = digit_prefix.match(first)
-        if m:
-            found.add(int(m.group(1)))
-            continue
-        m = vm_disk.match(first)
-        if m:
-            found.add(int(m.group(1)))
-            continue
-    return found
-
-
-def _next_free_pve_storage_volume_index(cfg_qemu: dict[str, Any], storage_id: str) -> int:
-    used = _volume_indices_on_storage(cfg_qemu, storage_id)
-    idx = 0
-    while idx in used:
-        idx += 1
-    return idx
-
-
-def _pve_disk_storage_volume_ref(disk_line: str) -> tuple[str, str] | None:
-    """
-    Parse ``STORAGE:volumeId`` from the first segment of a qm disk option string
-    (e.g. ``data15_nvme:vm-500-disk-3,cache=none,size=2G`` → ``(data15_nvme, vm-500-disk-3)``).
-    """
-    root = (disk_line or "").strip().split(",")[0].strip()
-    if ":" not in root:
-        return None
-    sid, vol = root.split(":", 1)
-    sid = sid.strip()
-    vol = vol.strip()
-    if sid and vol:
-        return (sid, vol)
-    return None
-
-
-def _disk_line_merge_options(disk_line: str, updates: dict[str, str]) -> str:
-    """Merge ``key=value`` options into a qm disk string; first comma segment is the volume reference."""
-    dl = (disk_line or "").strip()
-    if not dl:
-        return dl
-    parts = [x.strip() for x in dl.split(",") if x.strip()]
-    if not parts:
-        return dl
-    head = parts[0]
-    order: list[str] = []
-    seen: set[str] = set()
-    kv: dict[str, str] = {}
-    for seg in parts[1:]:
-        if "=" in seg:
-            k, _, v = seg.partition("=")
-            kl = k.strip().lower()
-            val = v.strip()
-        else:
-            kl = seg.lower()
-            val = ""
-        kv[kl] = val
-        if kl not in seen:
-            seen.add(kl)
-            order.append(kl)
-    for nk, nv in updates.items():
-        kl = nk.lower()
-        if kl not in seen:
-            seen.add(kl)
-            order.append(kl)
-        kv[kl] = nv
-    tail = ",".join(f"{k}={kv[k]}" if kv[k] != "" else k for k in order)
-    return f"{head},{tail}" if tail else head
 
 
 def _pre_first_boot_guest_resources_post(
@@ -623,48 +884,6 @@ def _apply_qemu_cpu_preset_to_guest(
         raise
 
 
-def _purge_pve_storage_volume(
-    proxmox: ProxmoxAPI,
-    cfg: dict[str, Any],
-    node: str,
-    storage_id: str,
-    volume_id: str,
-    vmid: int,
-    *,
-    cancel_poll: tuple[redis.Redis, dict[str, Any], str, str] | None,
-) -> None:
-    """Remove a disk image from a storage pool (``DELETE …/storage/{id}/content/{vol}``)."""
-    validate_scratch_purge_volume(cfg, vmid, volume_id)
-    resp = proxmox.nodes(node).storage(storage_id).content(volume_id).delete()
-    pve_check_api_response(resp, f"purge storage volume {storage_id}:{volume_id}")
-    wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_poll)
-
-
-def _delete_qemu_unused_slots_for_volume(
-    proxmox: ProxmoxAPI,
-    cfg: dict[str, Any],
-    node: str,
-    vmid: int,
-    storage_id: str,
-    volume_id: str,
-    *,
-    cancel_poll: tuple[redis.Redis, dict[str, Any], str, str] | None,
-) -> None:
-    """
-    Remove ``unusedN`` entries that still point at ``storage_id:volume_id`` (e.g. after ``delete=scsi0``
-    Proxmox may park the disk on ``unused0``; after purging the LV the slot can remain until deleted).
-    """
-    want = (storage_id, volume_id)
-    cfg_live = get_qemu_config(proxmox, node, vmid)
-    for key in sorted(k for k in cfg_live if isinstance(k, str) and re.fullmatch(r"unused\d+", k)):
-        line = (cfg_live.get(key) or "").strip()
-        if _pve_disk_storage_volume_ref(line) != want:
-            continue
-        resp = proxmox.nodes(node).qemu(vmid).config.post(delete=key)
-        pve_check_api_response(resp, f"delete {key} (scratch volume reference)")
-        wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_poll)
-
-
 def _build_proxmox_net0_spec(cfg: dict[str, Any], vlan_override: str | None = None) -> str:
     """
     virtio NIC on the configured bridge, Proxmox firewall off, MTU default 1500, optional VLAN tag.
@@ -692,6 +911,83 @@ def _build_proxmox_net0_spec(cfg: dict[str, Any], vlan_override: str | None = No
         except ValueError:
             pass
     return ",".join(parts)
+
+
+def _normalize_pve_tags(raw: Any) -> list[str]:
+    """Parse Proxmox tags from string/list and return unique, non-empty tags preserving order."""
+    parts: list[str] = []
+    if raw is None:
+        return parts
+    if isinstance(raw, (list, tuple, set)):
+        for v in raw:
+            s = str(v or "").strip()
+            if s:
+                parts.append(s)
+    else:
+        s = str(raw).strip()
+        if s:
+            parts.extend([x for x in re.split(r"[;,\s]+", s) if x])
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in parts:
+        k = t.lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _post_migration_tags(cfg: dict[str, Any]) -> list[str]:
+    """
+    Tags to apply when migration reaches COMPLETED.
+    - proxmox.post_migrate_tags unset -> default tracking tags.
+    - proxmox.post_migrate_tags empty string / [] -> disable tagging.
+    """
+    px = cfg.get("proxmox") or {}
+    if "post_migrate_tags" not in px:
+        return ["migrated", "efi-redo-pending"]
+    return _normalize_pve_tags(px.get("post_migrate_tags"))
+
+
+def _apply_post_migration_tags(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    proxmox: ProxmoxAPI,
+    job_id: str,
+    node: str,
+    vmid: int,
+    stage: str,
+) -> None:
+    """Best-effort VM tag update to track post-migration operator actions."""
+    wanted = _post_migration_tags(cfg)
+    if not wanted:
+        append_log(r, cfg, job_id, "INFO", stage, "post-migration VM tagging disabled by config")
+        return
+    cfg_now = get_qemu_config(proxmox, node, vmid)
+    existing = _normalize_pve_tags(cfg_now.get("tags"))
+    merged = _normalize_pve_tags([*existing, *wanted])
+    if [x.lower() for x in merged] == [x.lower() for x in existing]:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            stage,
+            f"post-migration VM tags already present: {';'.join(merged)}",
+        )
+        return
+    resp = proxmox.nodes(node).qemu(vmid).config.post(tags=";".join(merged))
+    pve_check_api_response(resp, "set post-migration VM tags")
+    wait_if_async(proxmox, cfg, node, resp, cancel_poll=None)
+    append_log(
+        r,
+        cfg,
+        job_id,
+        "INFO",
+        stage,
+        f"post-migration VM tags applied: {';'.join(merged)}",
+    )
 
 
 def _pve_error_text(exc: BaseException) -> str:
@@ -929,7 +1225,7 @@ def _job_simulated_import(data: dict[str, str], cfg: dict[str, Any]) -> bool:
 def _import_disk_format(p: dict[str, Any], vmdk_path: str) -> str:
     """
     PVE import-from format must match the source file.
-    format=raw with a .vmdk often fails silently or never creates sata0 — use vmdk or qcow2.
+    format=raw with a .vmdk often fails silently or never creates scsi0 — use vmdk or qcow2.
     """
     fmt = (p.get("import_disk_format") or "auto").strip().lower()
     if fmt == "auto":
@@ -946,6 +1242,40 @@ def _import_disk_format(p: dict[str, Any], vmdk_path: str) -> str:
         )
         return "vmdk"
     return fmt
+
+
+def _disk_line_merge_options(disk_line: str, updates: dict[str, str]) -> str:
+    """Merge/override ``key=value`` options on a qm disk string; preserve first volume segment."""
+    dl = (disk_line or "").strip()
+    if not dl:
+        return dl
+    parts = [x.strip() for x in dl.split(",") if x.strip()]
+    if not parts:
+        return dl
+    head = parts[0]
+    order: list[str] = []
+    seen: set[str] = set()
+    kv: dict[str, str] = {}
+    for seg in parts[1:]:
+        if "=" in seg:
+            k, _, v = seg.partition("=")
+            kl = k.strip().lower()
+            val = v.strip()
+        else:
+            kl = seg.lower()
+            val = ""
+        kv[kl] = val
+        if kl not in seen:
+            seen.add(kl)
+            order.append(kl)
+    for nk, nv in updates.items():
+        kl = nk.lower()
+        if kl not in seen:
+            seen.add(kl)
+            order.append(kl)
+        kv[kl] = nv
+    tail = ",".join(f"{k}={kv[k]}" if kv[k] != "" else k for k in order)
+    return f"{head},{tail}" if tail else head
 
 
 def _efi_tpm_disk_format(px: dict[str, Any]) -> str:
@@ -1044,7 +1374,7 @@ def ensure_ovmf_efidisk_and_vtpm(
         )
 
 
-def stage_import_vmdk_sata0(
+def stage_import_vmdk_scsi0(
     r: redis.Redis,
     cfg: dict[str, Any],
     proxmox: ProxmoxAPI,
@@ -1073,6 +1403,7 @@ def stage_import_vmdk_sata0(
             bios="ovmf",
             machine="q35",
             scsihw="virtio-scsi-single",
+            ide2="none,media=cdrom",
             agent="enabled=1",
             balloon=0,
             **{"allow-ksm": 0},
@@ -1081,7 +1412,7 @@ def stage_import_vmdk_sata0(
 
     hardware_change(r, cfg, job_id, MigrationState.IMPORTING.value, "create_vm_q35_ovmf", create_shell)
 
-    sata_spec = f"{storage}:0,import-from={vmdk_path},format={disk_fmt}"
+    scsi_spec = f"{storage}:0,import-from={vmdk_path},format={disk_fmt}"
 
     def attach_import() -> None:
         append_log(
@@ -1090,30 +1421,134 @@ def stage_import_vmdk_sata0(
             job_id,
             "INFO",
             MigrationState.IMPORTING.value,
-            f"import_vmdk_to_sata0 spec: sata0={sata_spec}",
+            f"import_vmdk_to_scsi0 spec: scsi0={scsi_spec}",
         )
-        resp = proxmox.nodes(node).qemu(vmid).config.post(sata0=sata_spec)
-        log.info("PVE config.post(sata0=...) response type=%s value=%r", type(resp).__name__, resp)
-        pve_check_api_response(resp, "import vmdk to sata0")
+        resp = proxmox.nodes(node).qemu(vmid).config.post(scsi0=scsi_spec, boot="order=scsi0")
+        log.info("PVE config.post(scsi0=...) response type=%s value=%r", type(resp).__name__, resp)
+        pve_check_api_response(resp, "import vmdk to scsi0")
         wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
         cfg_now = get_qemu_config(proxmox, node, vmid)
-        if not (cfg_now.get("sata0") or "").strip():
+        if not (cfg_now.get("scsi0") or "").strip():
             src_hint = (
                 "ESXi URI wrong or ESXi storage not linked in PVE"
                 if str(vmdk_path).lower().startswith("esxi:")
                 else f"file missing on the PVE node at {vmdk_path!r}"
             )
             raise RuntimeError(
-                "sata0 is still empty after import. Common causes: (1) "
+                "scsi0 is still empty after import. Common causes: (1) "
                 + src_hint
                 + "; (2) import_disk_format incompatible "
                 f"(effective format={disk_fmt!r}; for .vmdk use vmdk or qcow2); "
                 "(3) target storage does not support this import-from — check "
                 "Datacenter → Tasks on the node; (4) async import failed — see Redis job log."
             )
+        wait_proxmox_disk_import_quiescent(
+            r,
+            cfg,
+            job_id,
+            MigrationState.IMPORTING.value,
+            proxmox,
+            node,
+            vmid,
+            resp,
+            cancel_poll=cancel_imp,
+        )
 
-    hardware_change(r, cfg, job_id, MigrationState.IMPORTING.value, "import_vmdk_to_sata0", attach_import)
+    hardware_change(r, cfg, job_id, MigrationState.IMPORTING.value, "import_vmdk_to_scsi0", attach_import)
     ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+
+
+def stage_preimported_disk_to_scsi0(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    proxmox: ProxmoxAPI,
+    job_id: str,
+    node: str,
+    vmid: int,
+    storage: str,
+) -> None:
+    """
+    Pre-imported mode: VM shell + disk were prepared manually by operator (e.g. qm importdisk).
+    Normalize boot disk to scsi0 so downstream pipeline matches regular import flow.
+    """
+    stage = MigrationState.IMPORTING.value
+    cancel_imp = (r, cfg, job_id, stage)
+
+    def ensure_vm_stopped() -> None:
+        st = proxmox.nodes(node).qemu(vmid).status.current.get()
+        if st.get("status") == "running":
+            shutdown_or_stop_vm_retrying(
+                proxmox,
+                cfg,
+                node,
+                vmid,
+                cancel_poll=cancel_imp,
+                log_callback=lambda m: append_log(r, cfg, job_id, "INFO", stage, m),
+            )
+
+    hardware_change(r, cfg, job_id, stage, "preimported_ensure_stopped", ensure_vm_stopped)
+
+    def normalize_disk_to_scsi0() -> None:
+        cfg_now = get_qemu_config(proxmox, node, vmid)
+        scsi0 = (cfg_now.get("scsi0") or "").strip()
+        if scsi0:
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                stage,
+                "preimported mode: scsi0 already present; enforcing boot order scsi0",
+            )
+            resp = proxmox.nodes(node).qemu(vmid).config.post(boot="order=scsi0")
+            pve_check_api_response(resp, "preimported set boot order")
+            wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
+            ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+            return
+
+        src_key = ""
+        src_val = ""
+        for key in ("virtio0", "ide0", "sata0"):
+            v = (cfg_now.get(key) or "").strip()
+            if v:
+                src_key, src_val = key, v
+                break
+        if not src_key:
+            for key in sorted(k for k in cfg_now if isinstance(k, str) and re.fullmatch(r"unused\d+", k)):
+                v = (cfg_now.get(key) or "").strip()
+                if v:
+                    src_key, src_val = key, v
+                    break
+        if not src_key:
+            raise RuntimeError(
+                "preimported mode: no disk found on scsi0/sata0/virtio0/ide0/unusedN. "
+                "Import and attach disk first (e.g. qm importdisk + attach), then retry."
+            )
+
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            stage,
+            f"preimported mode: moving {src_key} -> scsi0 and setting boot order",
+        )
+        resp = proxmox.nodes(node).qemu(vmid).config.post(delete=src_key, scsi0=src_val, boot="order=scsi0")
+        pve_check_api_response(resp, "preimported disk -> scsi0")
+        wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
+        verify = get_qemu_config(proxmox, node, vmid)
+        if not (verify.get("scsi0") or "").strip():
+            raise RuntimeError("preimported mode: scsi0 missing after move from source disk slot")
+        ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+
+    hardware_change(
+        r,
+        cfg,
+        job_id,
+        stage,
+        "preimported_disk_to_scsi0",
+        normalize_disk_to_scsi0,
+    )
 
 
 def stage_simulated_clone(
@@ -1202,105 +1637,6 @@ def stage_simulated_clone(
     )
 
 
-def stage_simulated_scsi_to_sata_prep(
-    r: redis.Redis,
-    cfg: dict[str, Any],
-    proxmox: ProxmoxAPI,
-    job_id: str,
-    node: str,
-    vmid: int,
-) -> None:
-    """
-    After cloning a SCSI-boot template, move the OS volume from scsi0 to sata0 so the rest of the
-    pipeline matches a real VMware import (SATA boot → driver check → SCSI swap back to scsi0).
-    """
-    wcfg = cfg["worker"]
-    poll = float(wcfg.get("task_poll_interval_sec", 2))
-    shutdown_timeout = int(wcfg.get("shutdown_timeout_sec", 300))
-    cancel_imp = (r, cfg, job_id, MigrationState.IMPORTING.value)
-
-    def shutdown_guest() -> None:
-        def logm(msg: str) -> None:
-            append_log(r, cfg, job_id, "INFO", MigrationState.IMPORTING.value, msg)
-
-        shutdown_or_stop_vm_retrying(
-            proxmox,
-            cfg,
-            node,
-            vmid,
-            cancel_poll=cancel_imp,
-            log_callback=logm,
-        )
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.IMPORTING.value,
-        "sim_prep_shutdown",
-        shutdown_guest,
-    )
-
-    def wait_stopped() -> None:
-        wait_vm_stopped(
-            proxmox,
-            node,
-            vmid,
-            shutdown_timeout,
-            poll,
-            cancel_poll=cancel_imp,
-        )
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.IMPORTING.value,
-        "sim_prep_wait_stopped",
-        wait_stopped,
-    )
-
-    def move_scsi0_to_sata0() -> None:
-        cfg_now = get_qemu_config(proxmox, node, vmid)
-        scsi0 = (cfg_now.get("scsi0") or "").strip()
-        if not scsi0:
-            raise RuntimeError(
-                "simulated prep: scsi0 missing; template VM should have the OS disk on virtio-scsi scsi0"
-            )
-        sata_existing = (cfg_now.get("sata0") or "").strip()
-        if sata_existing:
-            append_log(
-                r,
-                cfg,
-                job_id,
-                "INFO",
-                MigrationState.IMPORTING.value,
-                "simulated prep: removing existing sata0 before attaching OS disk from scsi0",
-            )
-            resp0 = proxmox.nodes(node).qemu(vmid).config.post(delete="sata0")
-            pve_check_api_response(resp0, "sim prep delete sata0")
-            wait_if_async(proxmox, cfg, node, resp0, cancel_poll=cancel_imp)
-        resp = proxmox.nodes(node).qemu(vmid).config.post(
-            delete="scsi0",
-            sata0=scsi0,
-            boot="order=sata0",
-        )
-        pve_check_api_response(resp, "sim prep scsi0->sata0")
-        wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
-        verify = get_qemu_config(proxmox, node, vmid)
-        if not (verify.get("sata0") or "").strip():
-            raise RuntimeError("simulated prep: sata0 missing after scsi0->sata0 move")
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.IMPORTING.value,
-        "sim_prep_scsi0_to_sata0",
-        move_scsi0_to_sata0,
-    )
-
-
 def stage_sata_boot_extras(
     r: redis.Redis,
     cfg: dict[str, Any],
@@ -1313,55 +1649,47 @@ def stage_sata_boot_extras(
     cores: int,
     qemu_cpu_preset: str | None,
     vlan_override: str | None,
+    take_snapshot: bool,
 ) -> None:
     cancel_sata = (r, cfg, job_id, MigrationState.SATA_BOOT.value)
-    wcfg = cfg.get("worker") or {}
-    scratch = str(wcfg.get("pre_scsi_swap_scratch_disk_size", "2G")).strip() or "2G"
-    cfg_now = get_qemu_config(proxmox, node, vmid)
-    raw_idx = wcfg.get("pre_scsi_swap_scratch_disk_index")
-    if raw_idx not in (None, ""):
-        try:
-            vol_idx = int(raw_idx)
-        except (TypeError, ValueError):
-            vol_idx = _next_free_pve_storage_volume_index(cfg_now, storage)
-    else:
-        vol_idx = _next_free_pve_storage_volume_index(cfg_now, storage)
-    px = cfg.get("proxmox") or {}
-    scratch_fmt = _efi_tpm_disk_format(px)
-    scsi_spec = f"{storage}:{vol_idx},size={scratch},format={scratch_fmt}"
     net0_spec = _build_proxmox_net0_spec(cfg, vlan_override=vlan_override)
 
-    def snapshot_before_scratch_disk() -> None:
-        # Must run before scsi0 scratch exists so reverting the snapshot does not keep the scratch
-        # volume attached (which would block deleting it without removing the snapshot first).
-        if PRE_SCSI_SWAP_SNAPSHOT in _qemu_snapshot_names(proxmox, node, vmid):
+    def snapshot_before_boot() -> None:
+        if PRE_BOOT_SNAPSHOT in _qemu_snapshot_names(proxmox, node, vmid):
             append_log(
                 r,
                 cfg,
                 job_id,
                 "INFO",
                 MigrationState.SATA_BOOT.value,
-                f"snapshot {PRE_SCSI_SWAP_SNAPSHOT!r} already present; skipping create",
+                f"snapshot {PRE_BOOT_SNAPSHOT!r} already present; skipping create",
             )
             return
         resp = proxmox.nodes(node).qemu(vmid).snapshot.post(
-            snapname=PRE_SCSI_SWAP_SNAPSHOT,
-            description=(
-                "Automatic snapshot before virtio net + SCSI scratch disk "
-                "(SATA first-boot / pre–SCSI-swap checkpoint)"
-            ),
+            snapname=PRE_BOOT_SNAPSHOT,
+            description="Automatic snapshot before first boot checks.",
         )
-        pve_check_api_response(resp, "snapshot pre scratch disk")
+        pve_check_api_response(resp, "snapshot pre first boot")
         wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_sata)
 
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.SATA_BOOT.value,
-        "snapshot_pre_scsi_swap",
-        snapshot_before_scratch_disk,
-    )
+    if take_snapshot:
+        hardware_change(
+            r,
+            cfg,
+            job_id,
+            MigrationState.SATA_BOOT.value,
+            "snapshot_pre_first_boot",
+            snapshot_before_boot,
+        )
+    else:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.SATA_BOOT.value,
+            "snapshot_pre_first_boot: skipped by job option",
+        )
 
     def pre_first_boot_guest_resources() -> None:
         _pre_first_boot_guest_resources_post(
@@ -1383,8 +1711,51 @@ def stage_sata_boot_extras(
         pre_first_boot_guest_resources,
     )
 
+    def enforce_scsi0_performance_flags() -> None:
+        cfg_live = get_qemu_config(proxmox, node, vmid)
+        scsi0 = (cfg_live.get("scsi0") or "").strip()
+        if not scsi0:
+            raise RuntimeError("scsi0 missing in VM config before performance option tuning")
+        tuned = _disk_line_merge_options(
+            scsi0,
+            {
+                "ssd": "1",
+                "iothread": "1",
+                "discard": "on",
+                "aio": "native",
+            },
+        )
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.SATA_BOOT.value,
+            "scsi0 performance flags: ssd=1, iothread=1, discard=on, aio=native",
+        )
+        resp = proxmox.nodes(node).qemu(vmid).config.post(scsi0=tuned, boot="order=scsi0")
+        pve_check_api_response(resp, "apply scsi0 performance flags")
+        wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_sata)
+
+    hardware_change(
+        r,
+        cfg,
+        job_id,
+        MigrationState.SATA_BOOT.value,
+        "enforce_scsi0_perf_flags",
+        enforce_scsi0_performance_flags,
+    )
+
     preset_key = _qemu_cpu_preset_from_job(qemu_cpu_preset, cfg)
     if preset_key:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.SATA_BOOT.value,
+            f"cpu preset from job request: {preset_key}",
+        )
 
         def qemu_custom_cpu_args() -> None:
             _apply_qemu_cpu_preset_to_guest(
@@ -1407,10 +1778,20 @@ def stage_sata_boot_extras(
             "qemu_custom_cpu_args",
             qemu_custom_cpu_args,
         )
+    else:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.SATA_BOOT.value,
+            "no CPU preset selected: keeping imported/template CPU config as-is "
+            "(no forced cpu= default)",
+        )
 
-    def attach_net_and_scsi_scratch() -> None:
+    def apply_net_and_boot_order() -> None:
         # Drop any NICs from import/clone so we apply a single known-good virtio net (firewall off,
-        # MTU, optional VLAN) before first boot. Small empty SCSI disk on the same pool as the OS.
+        # MTU, optional VLAN) before first boot.
         cfg_live = get_qemu_config(proxmox, node, vmid)
         for key in sorted(k for k in cfg_live if isinstance(k, str) and re.fullmatch(r"net\d+", k)):
             append_log(
@@ -1429,20 +1810,11 @@ def stage_sata_boot_extras(
             job_id,
             "INFO",
             MigrationState.SATA_BOOT.value,
-            f"scsi scratch: index={vol_idx} spec={scsi_spec!r} (must not reuse sata0 import index)",
-        )
-        append_log(
-            r,
-            cfg,
-            job_id,
-            "INFO",
-            MigrationState.SATA_BOOT.value,
             f"net0: {net0_spec!r}",
         )
         resp = proxmox.nodes(node).qemu(vmid).config.post(
             net0=net0_spec,
-            scsi0=scsi_spec,
-            boot="order=sata0",
+            boot="order=scsi0",
         )
         wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_sata)
 
@@ -1451,8 +1823,8 @@ def stage_sata_boot_extras(
         cfg,
         job_id,
         MigrationState.SATA_BOOT.value,
-        "replace_net_virtio_and_scsi_scratch",
-        attach_net_and_scsi_scratch,
+        "replace_net_virtio_set_boot_scsi0",
+        apply_net_and_boot_order,
     )
 
 
@@ -1496,185 +1868,161 @@ def stage_driver_check_agent_ip(
     )
     append_log(r, cfg, job_id, "INFO", MigrationState.DRIVER_CHECK.value, f"guest ip: {ip}")
 
-    grace = float(wcfg.get("post_first_boot_agent_grace_sec", 60))
+    grace = float(wcfg.get("post_first_boot_agent_grace_sec", 120))
     append_log(
         r,
         cfg,
         job_id,
         "INFO",
         MigrationState.DRIVER_CHECK.value,
-        f"guest agent is up; waiting {grace}s before shutdown for SCSI swap",
+        f"guest agent is up; waiting {grace}s for driver/services stabilization",
     )
     _sleep_with_cancel(r, cfg, job_id, MigrationState.DRIVER_CHECK.value, grace)
-
-    def shutdown_after_first_boot() -> None:
-        def logm(msg: str) -> None:
-            append_log(r, cfg, job_id, "INFO", MigrationState.DRIVER_CHECK.value, msg)
-
-        shutdown_or_stop_vm_retrying(
-            proxmox,
-            cfg,
-            node,
-            vmid,
-            cancel_poll=cancel_dc,
-            log_callback=logm,
-        )
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.DRIVER_CHECK.value,
-        "shutdown_after_first_boot",
-        shutdown_after_first_boot,
-    )
-
-    poll = float(wcfg.get("task_poll_interval_sec", 2))
-    shutdown_timeout = int(wcfg.get("shutdown_timeout_sec", 300))
-
-    def wait_stopped_after_first_boot() -> None:
-        wait_vm_stopped(
-            proxmox,
-            node,
-            vmid,
-            shutdown_timeout,
-            poll,
-            cancel_poll=cancel_dc,
-        )
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.DRIVER_CHECK.value,
-        "wait_stopped_after_first_boot",
-        wait_stopped_after_first_boot,
-    )
     return ip
 
 
-def stage_scsi_swap(
+def _run_winrm_powershell(
+    *,
+    cfg: dict[str, Any],
+    ip: str,
+    user: str,
+    password: str,
+    script: str,
+) -> None:
+    w = cfg["winrm"]
+    port = int(w.get("port", 5985))
+    scheme = "https" if port == 5986 else "http"
+    endpoint = f"{scheme}://{ip}:{port}/wsman"
+    session = winrm.Session(
+        endpoint,
+        auth=(user, password),
+        transport=w.get("transport", "ntlm"),
+        server_cert_validation=w.get("server_cert_validation", "ignore"),
+        operation_timeout_sec=int(w.get("operation_timeout_sec", 300)),
+        read_timeout_sec=int(w.get("read_timeout_sec", 600)),
+    )
+    result = session.run_ps(script)
+    if result.status_code != 0:
+        stderr = result.std_err.decode(errors="replace") if result.std_err else ""
+        raise RuntimeError(f"WinRM exit {result.status_code}: {stderr}")
+
+
+def stage_efi_redo_tagged_vm(
     r: redis.Redis,
     cfg: dict[str, Any],
     proxmox: ProxmoxAPI,
     job_id: str,
     node: str,
     vmid: int,
+    storage: str,
+    *,
+    run_guest_script: bool,
+    win_user: str,
+    win_pass: str,
+    guest_script_override: str,
 ) -> None:
-    wcfg = cfg["worker"]
-    poll = float(wcfg.get("task_poll_interval_sec", 2))
-    shutdown_timeout = int(wcfg.get("shutdown_timeout_sec", 300))
-    cancel_scsi = (r, cfg, job_id, MigrationState.SCSI_SWAP.value)
+    stage = MigrationState.EFI_REDO.value
+    cancel = (r, cfg, job_id, stage)
+    px = cfg.get("proxmox") or {}
+    pending_tag = str(px.get("efi_redo_pending_tag") or "efi-redo-pending").strip()
+    migrated_tag = str(px.get("efi_redo_migrated_tag") or "migrated").strip()
+    done_tag = str(px.get("efi_redo_done_tag") or "efi-redo-done").strip()
 
-    def shutdown_guest() -> None:
-        def logm(msg: str) -> None:
-            append_log(r, cfg, job_id, "INFO", MigrationState.SCSI_SWAP.value, msg)
+    cfg_now = get_qemu_config(proxmox, node, vmid)
+    current_tags = _normalize_pve_tags(cfg_now.get("tags"))
+    lower = {t.lower() for t in current_tags}
+    need = [t for t in (migrated_tag, pending_tag) if t]
+    missing = [t for t in need if t.lower() not in lower]
+    if missing:
+        raise RuntimeError(
+            "EFI redo workflow requires VM tags: "
+            + ", ".join(need)
+            + f" (missing: {', '.join(missing)})"
+        )
 
+    if run_guest_script:
+        script = (guest_script_override or "").strip() or str(px.get("efi_redo_guest_script") or "").strip()
+        if not script:
+            raise RuntimeError(
+                "run_guest_script=true but no script provided; set proxmox.efi_redo_guest_script "
+                "or send guest_script_override"
+            )
+        if not win_user.strip():
+            raise RuntimeError("run_guest_script=true requires winrm_user")
+
+        def power_on() -> None:
+            st = proxmox.nodes(node).qemu(vmid).status.current.get()
+            if st.get("status") == "running":
+                return
+            proxmox.nodes(node).qemu(vmid).status.start.post()
+
+        hardware_change(r, cfg, job_id, stage, "power_on_for_guest_script", power_on)
+        ip = _wait_guest_agent_ipv4(
+            r,
+            cfg,
+            job_id,
+            stage,
+            proxmox,
+            node,
+            vmid,
+            cancel_poll=cancel,
+        )
+        r.hset(job_key(cfg, job_id), mapping={"guest_ip": ip, "updated_at": utc_now_iso()})
+        append_log(r, cfg, job_id, "INFO", stage, f"guest ip for EFI redo script: {ip}")
+        append_log(r, cfg, job_id, "INFO", stage, "winrm: run EFI redo guest script")
+        _run_winrm_powershell(cfg=cfg, ip=ip, user=win_user, password=win_pass, script=script)
+        append_log(r, cfg, job_id, "INFO", stage, "winrm: EFI redo guest script ok")
+
+    def ensure_stopped() -> None:
         shutdown_or_stop_vm_retrying(
             proxmox,
             cfg,
             node,
             vmid,
-            cancel_poll=cancel_scsi,
-            log_callback=logm,
+            cancel_poll=cancel,
+            log_callback=lambda m: append_log(r, cfg, job_id, "INFO", stage, m),
         )
+        wait_vm_stopped(proxmox, node, vmid, timeout_sec=600, poll=2, cancel_poll=cancel)
 
-    hardware_change(r, cfg, job_id, MigrationState.SCSI_SWAP.value, "shutdown_vm", shutdown_guest)
+    hardware_change(r, cfg, job_id, stage, "ensure_vm_stopped", ensure_stopped)
 
-    def wait_stopped() -> None:
-        wait_vm_stopped(
-            proxmox,
-            node,
-            vmid,
-            shutdown_timeout,
-            poll,
-            cancel_poll=cancel_scsi,
-        )
+    def recreate_efidisk() -> None:
+        cfg_live = get_qemu_config(proxmox, node, vmid)
+        cur = (cfg_live.get("efidisk0") or "").strip()
+        if cur:
+            append_log(r, cfg, job_id, "INFO", stage, f"remove existing efidisk0: {cur}")
+            resp_del = proxmox.nodes(node).qemu(vmid).config.post(delete="efidisk0")
+            pve_check_api_response(resp_del, "delete efidisk0")
+            wait_if_async(proxmox, cfg, node, resp_del, cancel_poll=cancel)
+        fmt = _efi_tpm_disk_format(px)
+        efispec = f"{storage}:1,format={fmt},efitype=4m,pre-enrolled-keys=1"
+        append_log(r, cfg, job_id, "INFO", stage, f"attach new efidisk0: {efispec}")
+        resp_add = proxmox.nodes(node).qemu(vmid).config.post(efidisk0=efispec)
+        pve_check_api_response(resp_add, "attach replacement efidisk0")
+        wait_if_async(proxmox, cfg, node, resp_add, cancel_poll=cancel)
 
-    hardware_change(r, cfg, job_id, MigrationState.SCSI_SWAP.value, "wait_stopped", wait_stopped)
+    hardware_change(r, cfg, job_id, stage, "recreate_efidisk0", recreate_efidisk)
 
-    cfg_qemu = get_qemu_config(proxmox, node, vmid)
-    sata0 = cfg_qemu.get("sata0")
-    if not sata0:
-        err = RuntimeError("sata0 missing in VM config before SCSI swap")
-        fail_job(r, cfg, job_id, MigrationState.SCSI_SWAP.value, err)
-        raise MigrationAborted from err
+    def update_tags() -> None:
+        cfg_live = get_qemu_config(proxmox, node, vmid)
+        tags = _normalize_pve_tags(cfg_live.get("tags"))
+        kept = [t for t in tags if t.lower() != pending_tag.lower()]
+        if done_tag and all(t.lower() != done_tag.lower() for t in kept):
+            kept.append(done_tag)
+        if kept:
+            resp = proxmox.nodes(node).qemu(vmid).config.post(tags=";".join(kept))
+        else:
+            resp = proxmox.nodes(node).qemu(vmid).config.post(delete="tags")
+        pve_check_api_response(resp, "update EFI redo tags")
+        wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel)
+        append_log(r, cfg, job_id, "INFO", stage, f"updated VM tags after EFI redo: {';'.join(kept)}")
 
-    scsi0_before = (cfg_qemu.get("scsi0") or "").strip()
+    hardware_change(r, cfg, job_id, stage, "update_efi_redo_tags", update_tags)
 
-    def move_os_disk_to_scsi0() -> None:
-        # Detach scratch scsi0, delete its backing volume from storage (not just unused), then move OS SATA→scsi0.
-        if scsi0_before:
-            scratch_ref = _pve_disk_storage_volume_ref(scsi0_before)
-            resp1 = proxmox.nodes(node).qemu(vmid).config.post(delete="scsi0")
-            wait_if_async(proxmox, cfg, node, resp1, cancel_poll=cancel_scsi)
-            if not scratch_ref:
-                append_log(
-                    r,
-                    cfg,
-                    job_id,
-                    "WARNING",
-                    MigrationState.SCSI_SWAP.value,
-                    "could not parse storage:volume from scsi0 scratch line; backing volume was not purged from storage",
-                )
-            else:
-                sid, vid = scratch_ref
-                try:
-                    _purge_pve_storage_volume(
-                        proxmox,
-                        cfg,
-                        node,
-                        sid,
-                        vid,
-                        vmid,
-                        cancel_poll=cancel_scsi,
-                    )
-                except Exception as exc:
-                    low = _pve_error_text(exc)
-                    if (
-                        "does not exist" in low
-                        or "no such file" in low
-                        or "not found" in low
-                        or "404" in low
-                    ):
-                        append_log(
-                            r,
-                            cfg,
-                            job_id,
-                            "INFO",
-                            MigrationState.SCSI_SWAP.value,
-                            f"scratch volume {sid}:{vid} already absent on storage after detach ({exc!r})",
-                        )
-                    else:
-                        raise
-                _delete_qemu_unused_slots_for_volume(
-                    proxmox,
-                    cfg,
-                    node,
-                    vmid,
-                    sid,
-                    vid,
-                    cancel_poll=cancel_scsi,
-                )
-        scsi0_os = _disk_line_merge_options(
-            str(sata0).strip(),
-            {"ssd": "1", "discard": "on", "aio": "native"},
-        )
-        resp2 = proxmox.nodes(node).qemu(vmid).config.post(
-            delete="sata0",
-            scsi0=scsi0_os,
-            boot="order=scsi0",
-        )
-        wait_if_async(proxmox, cfg, node, resp2, cancel_poll=cancel_scsi)
 
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.SCSI_SWAP.value,
-        "detach_sata0_attach_scsi0_set_boot",
-        move_os_disk_to_scsi0,
-    )
+# Horizon / Omnissa guest work via WinRM (``horizon.powershell_script``) is OFF while post-migrate steps
+# use Microsoft SCCM. Set True to restore optional guest WinRM script execution.
+RUN_HORIZON_WINRM_STAGE = False
 
 
 def stage_horizon_winrm(
@@ -1789,7 +2137,6 @@ def stage_horizon_winrm(
 
 def process_job(
     r: redis.Redis,
-    import_slots: threading.BoundedSemaphore,
     job_id: str,
 ) -> None:
     cfg = load_config()
@@ -1823,15 +2170,21 @@ def process_job(
             f"No proxmox_storage on job hash; using config default {storage!r} "
             "(set storage when enqueueing, e.g. migrate-selected or POST /jobs)",
         )
-    memory_mb = _job_int(data, "memory_mb", int(px_cfg.get("memory_mb", 8192)))
-    cores = _job_int(data, "cores", int(px_cfg.get("cores", 4)))
+    memory_mb = _job_int(data, "memory_mb", int(px_cfg.get("memory_mb", 16384)))
+    cores = _job_int(data, "cores", int(px_cfg.get("cores", 6)))
     qemu_cpu_preset_raw = (data.get("qemu_cpu_preset") or "").strip()
     qemu_cpu_preset = qemu_cpu_preset_raw or None
     vlan_override_raw = (data.get("vlan") or "").strip()
     vlan_override = vlan_override_raw if vlan_override_raw else None
     win_user = data.get("winrm_user") or "Administrator"
     win_pass = data.get("winrm_password") or ""
+    job_kind = (data.get("job_kind") or "").strip().lower()
+    run_guest_script = str(data.get("run_guest_script") or "").strip().lower() in ("1", "true", "yes", "on")
+    guest_script_override = (data.get("efi_redo_guest_script_override") or "").strip()
     simulated = _job_simulated_import(data, cfg)
+    preimported_mode = str(data.get("preimported_disk_mode") or "").strip().lower() in ("1", "true", "yes", "on")
+    take_snapshot_raw = str(data.get("take_snapshot") or "").strip().lower()
+    take_snapshot = take_snapshot_raw not in ("0", "false", "no", "off")
     simulated_source_vmid = _job_int(
         data,
         "simulated_clone_source_vmid",
@@ -1845,30 +2198,157 @@ def process_job(
         raise MigrationAborted from exc
 
     try:
+        if job_kind == "efi_redo":
+            if state == MigrationState.PENDING:
+                set_state(r, cfg, job_id, MigrationState.EFI_REDO)
+            data = r.hgetall(key)
+            state = MigrationState(data.get("state", MigrationState.EFI_REDO.value))
+            if state in (MigrationState.CANCELLED, MigrationState.FAILED):
+                return
+            if state == MigrationState.EFI_REDO:
+                stage_efi_redo_tagged_vm(
+                    r,
+                    cfg,
+                    proxmox,
+                    job_id,
+                    node,
+                    vmid,
+                    storage,
+                    run_guest_script=run_guest_script,
+                    win_user=win_user,
+                    win_pass=win_pass,
+                    guest_script_override=guest_script_override,
+                )
+                set_state(r, cfg, job_id, MigrationState.COMPLETED)
+                append_log(r, cfg, job_id, "INFO", MigrationState.COMPLETED.value, "efi redo workflow finished")
+            return
+
         if state in (MigrationState.PENDING, MigrationState.IMPORTING):
             if state == MigrationState.PENDING:
                 set_state(r, cfg, job_id, MigrationState.IMPORTING)
-            with import_slots:
-                if simulated:
-                    stage_simulated_clone(
+            if preimported_mode:
+                set_import_permit_status(
+                    r,
+                    cfg,
+                    job_id,
+                    bucket=None,
+                    permit_state="NONE",
+                )
+                stage_preimported_disk_to_scsi0(
+                    r, cfg, proxmox, job_id, node, vmid, storage
+                )
+            elif simulated:
+                set_import_permit_status(
+                    r,
+                    cfg,
+                    job_id,
+                    bucket=None,
+                    permit_state="NONE",
+                )
+                stage_simulated_clone(
+                    r,
+                    cfg,
+                    proxmox,
+                    job_id,
+                    node,
+                    vmid,
+                    vm_name,
+                    storage,
+                    simulated_source_vmid,
+                )
+                ensure_ovmf_efidisk_and_vtpm(
+                    r, cfg, proxmox, job_id, node, vmid, storage
+                )
+            else:
+                bucket = resolve_esxi_import_permit_bucket(cfg, vmdk_path)
+                permit_list: str | None = None
+                if bucket:
+                    set_import_permit_status(
                         r,
                         cfg,
-                        proxmox,
                         job_id,
-                        node,
-                        vmid,
-                        vm_name,
-                        storage,
-                        simulated_source_vmid,
+                        bucket=bucket,
+                        permit_state="WAITING",
                     )
-                    stage_simulated_scsi_to_sata_prep(
-                        r, cfg, proxmox, job_id, node, vmid
+                    wcfg = cfg.get("worker") or {}
+                    try:
+                        per_esxi = int(
+                            wcfg.get("max_concurrent_imports_per_esxi_storage", 1)
+                        )
+                    except (TypeError, ValueError):
+                        per_esxi = 1
+                    per_esxi = max(1, per_esxi)
+                    permit_list = ensure_esxi_import_permit_pool(
+                        r, cfg, bucket, per_esxi
                     )
-                    ensure_ovmf_efidisk_and_vtpm(
-                        r, cfg, proxmox, job_id, node, vmid, storage
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "INFO",
+                        MigrationState.IMPORTING.value,
+                        "v2 parallel imports: jobs on different ESXi storage ids (buckets) can run at the "
+                        "same time; jobs sharing the same bucket are limited to "
+                        f"max_concurrent_imports_per_esxi_storage={per_esxi} (shared across all worker replicas via Redis).",
+                    )
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "INFO",
+                        MigrationState.IMPORTING.value,
+                        f"ESXi import permit pool: bucket={bucket!r} redis_list={permit_list!r}",
+                    )
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "INFO",
+                        MigrationState.IMPORTING.value,
+                        "waiting for a free ESXi import permit (another job may be using this bucket)",
+                    )
+                    acquire_esxi_import_permit(
+                        r,
+                        cfg,
+                        permit_list,
+                        job_id,
+                        MigrationState.IMPORTING.value,
+                    )
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "INFO",
+                        MigrationState.IMPORTING.value,
+                        f"acquired ESXi import permit for bucket={bucket!r}; starting import-from",
+                    )
+                    set_import_permit_status(
+                        r,
+                        cfg,
+                        job_id,
+                        bucket=bucket,
+                        permit_state="ACQUIRED",
                     )
                 else:
-                    stage_import_vmdk_sata0(
+                    set_import_permit_status(
+                        r,
+                        cfg,
+                        job_id,
+                        bucket=None,
+                        permit_state="NONE",
+                    )
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "INFO",
+                        MigrationState.IMPORTING.value,
+                        "v2: no ESXi per-storage permit for this import path (not storageid:…/path.vmdk); "
+                        "this job is not serialized against others by ESXi storage bucket. "
+                        "Different buckets still run in parallel when paths use distinct storage ids.",
+                    )
+                try:
+                    stage_import_vmdk_scsi0(
                         r,
                         cfg,
                         proxmox,
@@ -1881,6 +2361,24 @@ def process_job(
                         memory_mb,
                         cores,
                     )
+                finally:
+                    if permit_list:
+                        release_esxi_import_permit(r, permit_list)
+                        set_import_permit_status(
+                            r,
+                            cfg,
+                            job_id,
+                            bucket=bucket,
+                            permit_state="RELEASED",
+                        )
+                        append_log(
+                            r,
+                            cfg,
+                            job_id,
+                            "INFO",
+                            MigrationState.IMPORTING.value,
+                            "released ESXi import permit (slot available for another job on this bucket)",
+                        )
             set_state(r, cfg, job_id, MigrationState.SATA_BOOT)
 
         data = r.hgetall(key)
@@ -1901,6 +2399,7 @@ def process_job(
                 cores,
                 qemu_cpu_preset,
                 vlan_override,
+                take_snapshot,
             )
             set_state(r, cfg, job_id, MigrationState.DRIVER_CHECK)
 
@@ -1911,7 +2410,7 @@ def process_job(
 
         if state == MigrationState.DRIVER_CHECK:
             ip = stage_driver_check_agent_ip(r, cfg, proxmox, job_id, node, vmid)
-            set_state(r, cfg, job_id, MigrationState.SCSI_SWAP)
+            set_state(r, cfg, job_id, MigrationState.HORIZON_CONFIG)
         else:
             ip = data.get("guest_ip") or ""
 
@@ -1921,7 +2420,15 @@ def process_job(
             return
 
         if state == MigrationState.SCSI_SWAP:
-            stage_scsi_swap(r, cfg, proxmox, job_id, node, vmid)
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                MigrationState.SCSI_SWAP.value,
+                "Legacy SCSI_SWAP state detected from an older job definition; "
+                "direct-SCSI boot flow skips disk swap and continues.",
+            )
             set_state(r, cfg, job_id, MigrationState.HORIZON_CONFIG)
 
         data = r.hgetall(key)
@@ -1930,18 +2437,78 @@ def process_job(
             return
 
         if state == MigrationState.HORIZON_CONFIG:
-            ip = (r.hget(key, "guest_ip") or "").strip() or ip
-            if not ip:
-                ip = data.get("guest_ip") or ""
-            if not ip:
-                err = RuntimeError("guest_ip missing before WinRM")
-                fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
-                raise MigrationAborted from err
-            stage_horizon_winrm(
-                r, cfg, job_id, proxmox, node, vmid, ip, win_user, win_pass
-            )
-            set_state(r, cfg, job_id, MigrationState.COMPLETED)
-            append_log(r, cfg, job_id, "INFO", MigrationState.COMPLETED.value, "migration finished")
+            if not RUN_HORIZON_WINRM_STAGE:
+                append_log(
+                    r,
+                    cfg,
+                    job_id,
+                    "INFO",
+                    MigrationState.HORIZON_CONFIG.value,
+                    "HORIZON_CONFIG skipped (RUN_HORIZON_WINRM_STAGE=False); marking COMPLETED.",
+                )
+                try:
+                    _apply_post_migration_tags(
+                        r,
+                        cfg,
+                        proxmox,
+                        job_id,
+                        node,
+                        vmid,
+                        MigrationState.HORIZON_CONFIG.value,
+                    )
+                except Exception as tag_exc:
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "WARNING",
+                        MigrationState.HORIZON_CONFIG.value,
+                        f"post-migration VM tags failed (continuing): {tag_exc}",
+                    )
+                set_state(r, cfg, job_id, MigrationState.COMPLETED)
+                append_log(
+                    r,
+                    cfg,
+                    job_id,
+                    "INFO",
+                    MigrationState.COMPLETED.value,
+                    "migration finished",
+                )
+            else:
+                # --- Original Horizon / WinRM path (re-enable with RUN_HORIZON_WINRM_STAGE = True) ---
+                ip = (r.hget(key, "guest_ip") or "").strip() or ip
+                if not ip:
+                    ip = data.get("guest_ip") or ""
+                if not ip:
+                    err = RuntimeError("guest_ip missing before WinRM")
+                    fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
+                    raise MigrationAborted from err
+                stage_horizon_winrm(
+                    r, cfg, job_id, proxmox, node, vmid, ip, win_user, win_pass
+                )
+                try:
+                    _apply_post_migration_tags(
+                        r,
+                        cfg,
+                        proxmox,
+                        job_id,
+                        node,
+                        vmid,
+                        MigrationState.HORIZON_CONFIG.value,
+                    )
+                except Exception as tag_exc:
+                    append_log(
+                        r,
+                        cfg,
+                        job_id,
+                        "WARNING",
+                        MigrationState.HORIZON_CONFIG.value,
+                        f"post-migration VM tags failed (continuing): {tag_exc}",
+                    )
+                set_state(r, cfg, job_id, MigrationState.COMPLETED)
+                append_log(
+                    r, cfg, job_id, "INFO", MigrationState.COMPLETED.value, "migration finished"
+                )
 
     except MigrationAborted:
         log.info("Job %s stopped or aborted after a failed stage", job_id)
@@ -1953,25 +2520,93 @@ def process_job(
 def worker_loop(cfg: dict[str, Any]) -> None:
     r = redis.from_url(cfg["redis"]["url"], decode_responses=True)
     q = cfg["redis"]["queue_key"]
-    max_imports = int(cfg.get("worker", {}).get("max_concurrent_imports", 3))
-    import_slots = threading.BoundedSemaphore(max_imports)
-    pool_workers = max(8, max_imports * 2)
+    wcfg = cfg.get("worker") or {}
+    try:
+        per_esxi = int(wcfg.get("max_concurrent_imports_per_esxi_storage", 1))
+    except (TypeError, ValueError):
+        per_esxi = 1
+    per_esxi = max(1, per_esxi)
+    try:
+        pool_workers = int(wcfg.get("job_thread_pool_size", max(16, per_esxi * 8)))
+    except (TypeError, ValueError):
+        pool_workers = max(16, per_esxi * 8)
+    pool_workers = max(4, pool_workers)
 
-    log.info("Worker up: queue=%s max_concurrent_imports=%s pool=%s", q, max_imports, pool_workers)
+    shutdown = threading.Event()
+    instance = f"{socket.gethostname()} pid={os.getpid()} config={CONFIG_PATH}"
+
+    def handle_sig(signum: int, _frame: object | None) -> None:
+        try:
+            sig_name = signal.Signals(signum).name
+        except ValueError:
+            sig_name = str(signum)
+        log.info(
+            "Received %s — %s will stop dequeuing new jobs and drain in-flight migrations",
+            sig_name,
+            instance,
+        )
+        shutdown.set()
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_sig)
+    signal.signal(signal.SIGINT, handle_sig)
+
+    log.info(
+        "Worker up (v2): instance=%s queue=%s max_concurrent_imports_per_esxi_storage=%s job_thread_pool_size=%s",
+        instance,
+        q,
+        per_esxi,
+        pool_workers,
+    )
+
+    pending: set[Future[Any]] = set()
+
+    def prune_done() -> None:
+        done = {f for f in pending if f.done()}
+        pending.difference_update(done)
 
     def run(job_id: str) -> None:
         try:
-            process_job(r, import_slots, job_id)
+            process_job(r, job_id)
         except Exception:
             log.exception("Worker thread crashed for job %s", job_id)
 
+    last_drain_log = 0.0
     with ThreadPoolExecutor(max_workers=pool_workers) as executor:
         while True:
+            prune_done()
+            if shutdown.is_set():
+                if not pending:
+                    log.info("Worker shutdown complete (%s)", instance)
+                    break
+                now = time.monotonic()
+                if now - last_drain_log >= 60.0:
+                    log.info(
+                        "Shutdown: waiting for %d in-flight migration(s) (%s)",
+                        len(pending),
+                        instance,
+                    )
+                    last_drain_log = now
+                wait(pending, timeout=10.0, return_when=FIRST_COMPLETED)
+                continue
+
             item = r.blpop(q, timeout=30)
             if item is None:
                 continue
             _, job_id = item
-            executor.submit(run, job_id)
+            if shutdown.is_set():
+                try:
+                    r.lpush(q, job_id)
+                except Exception:
+                    log.exception(
+                        "Failed to re-queue job %s during shutdown — re-enqueue manually if needed",
+                        job_id,
+                    )
+                else:
+                    log.info("Re-queued job %s (shutdown before worker thread started)", job_id)
+                continue
+            fut = executor.submit(run, job_id)
+            pending.add(fut)
 
 
 def main() -> None:

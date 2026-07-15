@@ -27,8 +27,21 @@ def _config_path() -> Path:
 
 
 def load_yaml() -> dict[str, Any]:
+    try:
+        from config_validate import validate_loaded_config
+    except ModuleNotFoundError:
+        def validate_loaded_config(data: Any) -> dict[str, Any]:
+            if data is None:
+                raise ValueError("config file is empty")
+            if not isinstance(data, dict):
+                raise TypeError(f"config root must be a mapping, got {type(data).__name__}")
+            return data
+
     with _config_path().open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    if raw is None:
+        raise ValueError("config file is empty")
+    return validate_loaded_config(raw)
 
 
 def save_yaml(cfg: dict[str, Any]) -> None:
@@ -545,6 +558,32 @@ def _esxi_uri_from_volid(volid: str) -> str | None:
     return None
 
 
+def _listing_item_size_bytes(item: dict[str, Any]) -> int:
+    """
+    Bytes from a Proxmox ``/nodes/{node}/storage/{id}/content`` row (``size`` field).
+    The API may return numbers as int, float, or string (including ``\"…\"`` floats); missing or
+    non-positive values yield 0.
+    """
+    v = item.get("size")
+    if v is None or v == "":
+        return 0
+    try:
+        if isinstance(v, bool):
+            return 0
+        if isinstance(v, int):
+            return v if v > 0 else 0
+        if isinstance(v, float):
+            n = int(v)
+            return n if n > 0 else 0
+        s = str(v).strip()
+        if not s:
+            return 0
+        n = int(float(s))
+        return n if n > 0 else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _esxi_uri_parent_directory_lower(uri: str) -> str | None:
     """Lowercased ``esxi:…/dir`` containing the file (VM folder), or None."""
     u = (uri or "").strip()
@@ -589,6 +628,44 @@ def _guess_esxi_vmdk_from_vmx_uri(uri: str) -> list[str]:
             seen.add(c)
             dedup.append(c)
     return dedup
+
+
+def _guess_import_refs_from_vmx(vmx_uri: str, vmx_volid: str) -> list[str]:
+    """
+    Guess ``import-from`` references for a VMX entry while preserving storage-id prefix when available.
+
+    Example:
+    - vmx_volid: ``sh12:ha-datacenter/DS1/VM/VM.vmx``
+    - guessed uri: ``esxi:ha-datacenter/DS1/VM/VM.vmdk``
+    -> import ref: ``sh12:ha-datacenter/DS1/VM/VM.vmdk``
+    """
+    guesses = _guess_esxi_vmdk_from_vmx_uri(vmx_uri)
+    if not guesses:
+        return []
+
+    refs: list[str] = []
+    raw = (vmx_volid or "").strip()
+    sid = ""
+    if raw and ":" in raw and "esxi:" not in raw.lower():
+        sid, _sep, _tail = raw.partition(":")
+        sid = sid.strip()
+
+    if sid:
+        for g in guesses:
+            gl = g.lower()
+            if gl.startswith("esxi:"):
+                refs.append(f"{sid}:{g[5:]}")
+            else:
+                refs.append(f"{sid}:{g}")
+    refs.extend(guesses)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in refs:
+        if r and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
 
 
 def _inventory_uri_rank(uri: str, name_lower: str, *, ext: str) -> tuple[int, int, int, int]:
@@ -659,7 +736,7 @@ def discover_esxi_import_from_pve(node: str, vm_name: str) -> str | None:
     scored: list[tuple[int, int, int, int, str, int, str]] = []
     nlow = name.lower()
     vmx_dirs: set[str] = set()
-    vmx_uris: list[tuple[int, int, str, int]] = []
+    vmx_uris: list[tuple[int, int, str, int, str]] = []
 
     for sid in esxi_ids:
         try:
@@ -678,10 +755,7 @@ def discover_esxi_import_from_pve(node: str, vm_name: str) -> str | None:
             if not uri:
                 continue
             vlow = uri.lower()
-            try:
-                size = int(it.get("size") or 0)
-            except (TypeError, ValueError):
-                size = 0
+            size = _listing_item_size_bytes(it)
 
             if vlow.endswith(".vmx"):
                 label = _guest_label_from_esxi_path(uri)
@@ -691,7 +765,7 @@ def discover_esxi_import_from_pve(node: str, vm_name: str) -> str | None:
                         vmx_dirs.add(d)
                     depth, rank, _, _ = _inventory_uri_rank(uri, nlow, ext="vmx")
                     shallow = 1 if esxi_import_uri_shallow_alias(uri, name) else 0
-                    vmx_uris.append((depth, rank, uri, shallow))
+                    vmx_uris.append((depth, rank, uri, shallow, volid))
                 continue
 
             if not vlow.endswith(".vmdk"):
@@ -729,10 +803,7 @@ def discover_esxi_import_from_pve(node: str, vm_name: str) -> str | None:
             parent = _esxi_uri_parent_directory_lower(uri)
             if not parent or parent not in vmx_dirs:
                 continue
-            try:
-                size = int(it.get("size") or 0)
-            except (TypeError, ValueError):
-                size = 0
+            size = _listing_item_size_bytes(it)
             depth, rank, _, prefer = _inventory_uri_rank(uri, nlow, ext="vmdk")
             shallow = 1 if esxi_import_uri_shallow_alias(uri, name) else 0
             scored.append((depth, rank, size, prefer, uri, shallow, volid))
@@ -741,8 +812,8 @@ def discover_esxi_import_from_pve(node: str, vm_name: str) -> str | None:
         if not vmx_uris:
             return None
         vmx_uris.sort(key=lambda x: (-x[0], -x[1], x[3]))
-        for _depth, _rank, vmx_uri, _shallow in vmx_uris:
-            guessed = _guess_esxi_vmdk_from_vmx_uri(vmx_uri)
+        for _depth, _rank, vmx_uri, _shallow, vmx_volid in vmx_uris:
+            guessed = _guess_import_refs_from_vmx(vmx_uri, vmx_volid)
             if guessed:
                 return guessed[0]
         return None
@@ -786,6 +857,13 @@ def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> lis
     List guests visible on Proxmox ESXi-linked storage (storage content API). No vCenter.
     Scans both ``.vmdk`` and ``.vmx`` volids (PVE may list one more reliably than the other).
     One row per inferred guest name; best path prefers a matching ``.vmdk`` when scores tie.
+
+    Each row includes ``esxi_storage_ids``: sorted Proxmox **storage** ids (e.g. ``sh12``, ``sh13``) where
+    that guest appeared in listings — used in the UI for import parallelism hints.
+
+    ``esxi_listing_size_bytes`` is the ``size`` field from the storage content API for the chosen
+    import candidate (metadata only; no VMX/VMDK file download). Values are parsed flexibly because
+    some PVE/API layers return ``size`` as a string or float.
     """
     nod = (node or "").strip() or str((cfg.get("proxmox") or {}).get("default_node") or "").strip()
     if not nod:
@@ -806,8 +884,8 @@ def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> lis
         and str(s.get("storage", "")).strip()
     ]
     # shallow=1 deprioritized vs deeper paths (same guest may list both)
-    # tuple: (depth, rank, size, prefer, uri_norm, shallow, import_ref)
-    buckets: dict[str, list[tuple[int, int, int, int, str, int, str]]] = {}
+    # tuple: (depth, rank, size, prefer, uri_norm, shallow, import_ref, pve_storage_id)
+    buckets: dict[str, list[tuple[int, int, int, int, str, int, str, str]]] = {}
 
     for sid in esxi_ids:
         try:
@@ -831,15 +909,12 @@ def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> lis
             label = _guest_label_from_esxi_path(uri)
             if not label:
                 continue
-            try:
-                size = int(it.get("size") or 0)
-            except (TypeError, ValueError):
-                size = 0
+            size = _listing_item_size_bytes(it)
             k = label.lower()
             ext = "vmdk" if vlow.endswith(".vmdk") else "vmx"
             depth, rank, _, prefer = _inventory_uri_rank(uri, k, ext=ext)
             shallow = 1 if esxi_import_uri_shallow_alias(uri, label) else 0
-            buckets.setdefault(k, []).append((depth, rank, size, prefer, uri, shallow, volid))
+            buckets.setdefault(k, []).append((depth, rank, size, prefer, uri, shallow, volid, sid))
 
     out: list[dict[str, Any]] = []
     for _k, candidates in buckets.items():
@@ -848,17 +923,40 @@ def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> lis
         candidates.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], x[5]))
         best_uri = candidates[0][4]
         best_import_ref = candidates[0][6]
+        best_size = candidates[0][2]
         if best_uri.lower().endswith(".vmx"):
             vmdk_only = [c for c in candidates if c[4].lower().endswith(".vmdk")]
             if vmdk_only:
                 vmdk_only.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], x[5]))
                 best_uri = vmdk_only[0][4]
                 best_import_ref = vmdk_only[0][6]
+                best_size = vmdk_only[0][2]
         display = _guest_label_from_esxi_path(best_uri) or _k
         import_uri = best_import_ref if best_uri.lower().endswith(".vmdk") else None
+        guesses: list[str] = []
         if import_uri is None and best_uri.lower().endswith(".vmx"):
-            guesses = _guess_esxi_vmdk_from_vmx_uri(best_uri)
+            guesses = _guess_import_refs_from_vmx(best_uri, best_import_ref)
             import_uri = guesses[0] if guesses else None
+            if import_uri and guesses:
+                ref_set = {str(r).strip() for r in guesses if str(r).strip()}
+                norm_set: set[str] = set()
+                for r in ref_set:
+                    n = (_esxi_uri_from_volid(r) or "").strip().lower()
+                    if n:
+                        norm_set.add(n)
+                best_size = 0
+                for c in candidates:
+                    vol = str(c[6] or "").strip()
+                    if vol in ref_set:
+                        best_size = c[2]
+                        break
+                    cn = (_esxi_uri_from_volid(vol) or "").strip().lower()
+                    if cn and cn in norm_set:
+                        best_size = c[2]
+                        break
+        storage_ids = sorted(
+            {str(c[7]).strip() for c in candidates if len(c) > 7 and str(c[7]).strip()}
+        )
         out.append(
             {
                 "name": display,
@@ -867,6 +965,8 @@ def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> lis
                 "power_state": None,
                 "inventory_source": "pve_esxi",
                 "esxi_import_uri": import_uri,
+                "esxi_storage_ids": storage_ids,
+                "esxi_listing_size_bytes": best_size if best_size > 0 else None,
             }
         )
     out.sort(key=lambda x: x["name"].lower())

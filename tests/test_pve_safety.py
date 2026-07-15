@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from pve_safety import validate_job_vmid_and_storage, validate_scratch_purge_volume
+from pve_safety import proxmox_safety, validate_job_vmid_and_storage, validate_scratch_purge_volume
 
 
 def test_validate_vmid_in_range() -> None:
@@ -15,6 +15,12 @@ def test_validate_vmid_in_range() -> None:
         }
     }
     validate_job_vmid_and_storage(cfg, 150, "local-lvm")
+
+
+def test_validate_vmid_above_max() -> None:
+    cfg = {"proxmox": {"safety": {"allowed_vmid_min": 100, "allowed_vmid_max": 200}}}
+    with pytest.raises(ValueError, match="above"):
+        validate_job_vmid_and_storage(cfg, 201, "local-lvm")
 
 
 def test_validate_vmid_below_min() -> None:
@@ -45,6 +51,11 @@ def test_validate_scratch_purge_name_rejected() -> None:
     cfg = {"proxmox": {"safety": {"scratch_purge_require_vm_disk_name": True}}}
     with pytest.raises(ValueError, match="Refusing to purge"):
         validate_scratch_purge_volume(cfg, 3500, "vm-9999-disk-0")
+
+
+def test_proxmox_safety_missing_returns_empty_mapping() -> None:
+    assert proxmox_safety({}) == {}
+    assert proxmox_safety({"proxmox": {}}) == {}
 
 
 def test_invalid_vmid_range_in_config() -> None:
