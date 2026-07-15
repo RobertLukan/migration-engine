@@ -260,6 +260,11 @@ def infer_esxi_import_uri(vm: vim.VirtualMachine) -> str:
     moRef inventory folders. Optional ``proxmox.esxi_import_parent_hint`` prepends
     one folder when the guest still resolves to ``DC/vm/vm.vmdk``.
     """
+    if getattr(vm, "snapshot", None) is not None:
+        raise ui_module.SnapshotPresentError(
+            f"VM {vm.name!r} still has VMware snapshot(s); consolidate/remove them in vSphere "
+            "before migrating (importing now would copy stale, snapshot-time disk data)."
+        )
     dc = _datacenter_for_vm(vm)
     if not dc:
         raise ValueError(f"VM {vm.name!r} has no datacenter in its parent chain")
@@ -331,6 +336,48 @@ def resolve_vmdk_import_path(
         f"auto-esxi: no esxi:… disk in Proxmox ESXi storage listings for {vm_name!r} on node {nod!r}; "
         "link ESXi in PVE, check Datastore.Audit permissions, or save VMware credentials for vCenter path fallback."
     )
+
+
+def _assert_no_vmware_snapshots_esxi(node: str | None, names: list[str]) -> None:
+    """
+    Refuse enqueue when a source guest still has VMware snapshots on ESXi-linked
+    storage. Importing the base ``<name>.vmdk`` of a snapshotted VM copies the disk
+    as of the snapshot (current data lives in the ``-000001.vmdk`` delta chain), so
+    the migration would silently import stale data. Detection is best-effort: on any
+    listing/permission error the guard is skipped (fails open).
+    """
+    nod = (node or "").strip()
+    if not nod:
+        return
+    try:
+        dmap = ui_module.esxi_snapshot_delta_map(nod)
+    except Exception:
+        return
+    if not dmap:
+        return
+    blocked: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        nm = (raw or "").strip()
+        lk = nm.lower()
+        if not nm or lk in seen:
+            continue
+        seen.add(lk)
+        deltas = dmap.get(lk) or []
+        if deltas:
+            shown = ", ".join(d.rsplit("/", 1)[-1] for d in deltas[:3])
+            more = "" if len(deltas) <= 3 else f", +{len(deltas) - 3} more"
+            blocked.append(f"{nm} ({shown}{more})")
+    if blocked:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Refusing to import: source VM(s) still have VMware snapshots. Importing now "
+                "would copy stale, snapshot-time disk data instead of the current state. "
+                "Consolidate/remove all snapshots in vSphere, then retry. Affected: "
+                + "; ".join(blocked)
+            ),
+        )
 
 
 def utc_now_iso() -> str:
@@ -847,6 +894,8 @@ def create_job(body: CreateJobRequest) -> JobRecord:
     use_preimported = bool(body.preimported_disk_mode)
     if use_preimported and use_simulated:
         raise HTTPException(status_code=400, detail="preimported_disk_mode and simulated_import cannot both be true")
+    if not use_simulated and not use_preimported:
+        _assert_no_vmware_snapshots_esxi(node, [body.vm_name])
     template = (px.get("vmdk_path_template") or "").strip()
     vmdk = (body.vmdk_path_on_node or "").strip()
     if use_preimported:
@@ -998,6 +1047,8 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     job_ids: list[str] = []
     storage = body.proxmox_storage.strip()
     node_str = str(node).strip()
+    if not use_simulated and import_mode == "standard":
+        _assert_no_vmware_snapshots_esxi(node_str, ordered)
     proxmox = connect_proxmox(cfg)
     try:
         in_use = qemu_vmids_in_use_cluster(proxmox)

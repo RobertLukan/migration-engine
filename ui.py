@@ -5,6 +5,7 @@ Dashboard auth, credential editing (config.yaml), and connectivity tests.
 from __future__ import annotations
 
 import copy
+import re
 import secrets
 from contextlib import contextmanager
 from pathlib import Path
@@ -850,6 +851,120 @@ def _guest_label_from_esxi_path(uri: str) -> str | None:
 def _guest_label_from_esxi_uri(uri: str) -> str | None:
     """Backward-compatible alias for :func:`_guest_label_from_esxi_path`."""
     return _guest_label_from_esxi_path(uri)
+
+
+class SnapshotPresentError(ValueError):
+    """
+    Raised when a source VM still has VMware snapshots.
+
+    Importing such a VM by its base ``<name>.vmdk`` reads the disk *as of the
+    snapshot* (the current data lives in the ``<name>-000001.vmdk`` delta chain),
+    so the migration would silently copy stale, snapshot-time data. Subclasses
+    ``ValueError`` so existing ``except ValueError`` handlers surface it as a 400.
+    """
+
+
+# VMware snapshot/redo descriptors are ``<base>-NNNNNN.vmdk`` (6-digit counter).
+# Base/aux files (``-flat``, ``-delta``, ``-sesparse``, ``-ctk``) never match this.
+_SNAPSHOT_DELTA_RE = re.compile(r"^(?P<base>.+)-\d{6}\.vmdk$", re.IGNORECASE)
+
+
+def _esxi_uri_path_parts(uri: str) -> list[str]:
+    u = (uri or "").strip()
+    if not u.lower().startswith("esxi:"):
+        return []
+    tail = u[5:].strip().strip("/")
+    return [p for p in tail.split("/") if p]
+
+
+def _bucket_snapshot_deltas(vmdk_uris: Iterator[str]) -> dict[str, list[str]]:
+    """
+    Bucket ``esxi:…`` ``.vmdk`` URIs that are VMware snapshot delta descriptors
+    (``<base>-NNNNNN.vmdk``) by guest name (lowercased). Keys include both the
+    delta's base file stem and its parent folder name so per-VM-folder and flat
+    datastore layouts are both covered. Pure/side-effect free for testability.
+    """
+    out: dict[str, list[str]] = {}
+    for uri in vmdk_uris:
+        u = (uri or "").strip()
+        if not u.lower().endswith(".vmdk"):
+            continue
+        parts = _esxi_uri_path_parts(u)
+        if len(parts) < 2:
+            continue
+        m = _SNAPSHOT_DELTA_RE.match(parts[-1])
+        if not m:
+            continue
+        base = m.group("base")
+        parent = parts[-2]
+        for key in {base.strip().lower(), parent.strip().lower()}:
+            if not key:
+                continue
+            out.setdefault(key, [])
+            if u not in out[key]:
+                out[key].append(u)
+    for key in out:
+        out[key].sort()
+    return out
+
+
+def esxi_snapshot_delta_map(node: str) -> dict[str, list[str]]:
+    """
+    Scan ESXi-type storages on ``node`` once and bucket any VMware snapshot delta
+    descriptors (``<base>-NNNNNN.vmdk``) by guest name (lowercased).
+
+    A non-empty list for a guest means that guest still has snapshots and must be
+    consolidated in vSphere before import. Returns ``{}`` on any API/permission
+    error (fail open: detection is best-effort and must not block otherwise-valid
+    migrations).
+    """
+    nod = (node or "").strip()
+    if not nod:
+        return {}
+    try:
+        cfg = load_yaml()
+        px = cfg.get("proxmox") or {}
+        api = _proxmox_from_dict(px)
+        raw = api.nodes(nod).storage.get()
+    except Exception:
+        return {}
+    if not isinstance(raw, list):
+        return {}
+    esxi_ids = [
+        str(s.get("storage"))
+        for s in raw
+        if isinstance(s, dict)
+        and str(s.get("type", "")).lower() == "esxi"
+        and str(s.get("storage", "")).strip()
+    ]
+
+    def _iter_vmdk_uris() -> Iterator[str]:
+        for sid in esxi_ids:
+            try:
+                items = api.nodes(nod).storage(sid).content.get()
+            except Exception:
+                continue
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                volid = str(it.get("volid") or "").strip()
+                if not volid or not volid.lower().endswith(".vmdk"):
+                    continue
+                uri = _esxi_uri_from_volid(volid)
+                if uri:
+                    yield uri
+
+    return _bucket_snapshot_deltas(_iter_vmdk_uris())
+
+
+def esxi_guest_snapshot_delta_uris(node: str, vm_name: str) -> list[str]:
+    """Snapshot delta descriptor URIs for a single guest (empty if none / on error)."""
+    key = (vm_name or "").strip().lower()
+    if not key:
+        return []
+    return esxi_snapshot_delta_map(node).get(key, [])
 
 
 def enumerate_guests_from_pve_esxi(cfg: dict[str, Any], node: str | None) -> list[dict[str, Any]]:
