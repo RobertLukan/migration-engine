@@ -424,7 +424,7 @@ class CreateJobRequest(BaseModel):
         default=None,
         description=(
             "Clears PVE cpu= and sets qemu args to a fixed -cpu host profile (nested/VBS variants). "
-            "None applies default cpu=host via non-root VM config path."
+            "None keeps the imported/template CPU config as-is (no forced cpu= default)."
         ),
     )
     take_snapshot: bool = Field(
@@ -471,7 +471,7 @@ class MigrateSelectedRequest(BaseModel):
     )
     qemu_cpu_preset: Literal["host_no_nested", "host_nested_vbs"] | None = Field(
         default=None,
-        description="Custom qemu -cpu via args=; None applies default cpu=host (non-root path).",
+        description="Custom qemu -cpu via args=; None keeps the imported/template CPU config as-is.",
     )
     take_snapshot: bool = Field(
         default=True,
