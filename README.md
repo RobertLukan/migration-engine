@@ -1,12 +1,12 @@
 # Migration Engine
 
-VMware → Proxmox migration orchestrator (**v2.2.0**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, then first-boot guest-agent checks.
+VMware → Proxmox migration orchestrator (**v2.2.1**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, then first-boot guest-agent checks.
 
 ## Intended use
 
 Supports **Windows 11**, **Windows Server**, and **Linux** guests equally. Match firmware to the source (UEFI or SeaBIOS); **vTPM** is attached by default only for UEFI + Windows (opt in for other cases). Forcing UEFI on a legacy-BIOS guest will not boot — prefer **importer-resolved** firmware from Proxmox VMX `import-metadata`, or override per VM in the Migrate dialog.
 
-## Features (v2.2)
+## Features (v2.2+)
 
 - **Real ESXi → Proxmox import** via PVE `import-from` / linked ESXi storage (`auto-esxi` or path templates). Simulated template-clone import was removed.
 - **Firmware & guest profile from import-metadata** — the Migrate dialog can use Proxmox VMX `import-metadata` (BIOS type, guest hints, memory/cores) per VM, or **override** firmware/profile/vTPM in a per-VM matrix.
@@ -51,6 +51,8 @@ python worker.py
 Open **http://127.0.0.1:8000/** and sign in with `ui.password`. The footer shows **version** (and optional **build** id from `MIGRATION_ENGINE_GIT_REVISION`). Public JSON: `GET /version`, `GET /health`.
 
 ## Docker
+
+**Container image (GHCR):** [`ghcr.io/robertlukan/migration-engine`](https://github.com/RobertLukan/migration-engine/pkgs/container/migration-engine) (published on each GitHub release).
 
 See **[DOCKER.md](DOCKER.md)** for Compose (Redis + API + worker). Scale workers for more dequeue capacity, for example:
 
@@ -206,3 +208,22 @@ You do not need to upload the project by hand if the Docker VM can **`git pull`*
 ## Build metadata (optional)
 
 Set **`MIGRATION_ENGINE_GIT_REVISION`** in the environment (e.g. Docker `ARG` / `ENV` at build time) so `/version` and the UI footer show a short git SHA or pipeline id.
+
+---
+
+## The Proxmox Enterprise Lifecycle Suite
+
+This repository is part of an open-source automation suite engineered to bring enterprise orchestration, zero-drama cutovers, and verifiable disaster recovery to **Proxmox VE** and **Proxmox Backup Server**:
+
+| Lifecycle Phase | Project | Description |
+| :--- | :--- | :--- |
+| **1. Migrate (Day 0)** | [**migration-engine**](https://github.com/RobertLukan/migration-engine) *(this repo)* | VMware ESXi → Proxmox VE mass migration orchestrator (FastAPI + Redis worker queue, direct SCSI boot import, import-metadata firmware/resources, guest-agent checks). |
+| **2. Provision (Day 1)** | [**proxmox-guestos-customization**](https://github.com/RobertLukan/proxmox-guestos-customization) | VMware-style Windows template cloning, QGA-driven Sysprep, static/DHCP networking, AD domain join, and bulk VDI rollout sidecar. |
+| **3. Recover & Assure (Day 2)** | [**restore-engine**](https://github.com/RobertLukan/restore-engine) | Multi-cluster PBS → PVE disaster recovery orchestrator, automated isolated DR drills, QGA/HTTP assurance gates, and RTO compliance reporting. |
+| **4. Foundation (IaC)** | *PVE Infrastructure-as-Code (WIP)* | Declarative cluster state, SDN, Ceph/storage, and zero-drift configuration management *(Public preview coming soon)*. |
+
+### Enterprise Architecture & Commercial Support
+
+Maintained by **Robert Lukan** — Founder & Principal Architect at **Stackvolve Systems Ltd**.  
+Planning a large-scale transition off VMware or legacy HCI toward open-source European digital sovereignty? We help organizations design, automate, and execute production Proxmox VE & Ceph migrations and NIS2-compliant DR architectures.  
+Connect via [**LinkedIn**](https://www.linkedin.com/in/robertlukan/) or reach out through [**Stackvolve Systems**](https://github.com/RobertLukan).

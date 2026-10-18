@@ -449,6 +449,18 @@
       margin-right: auto;
       width: 100%;
     }
+    .app-footer .footer-suite {
+      display: block;
+      margin-top: 0.35rem;
+      line-height: 1.45;
+    }
+    .app-footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .app-footer a:hover {
+      text-decoration: underline;
+    }
     #login-screen main {
       min-height: 60vh;
       display: flex;
@@ -474,8 +486,14 @@
           <button type="button" class="primary" id="btn-login">Sign in</button>
         </div>
       </div>
-      <footer class="app-footer" aria-label="Application version">
+      <footer class="app-footer" aria-label="Application version and related projects">
         <span id="login-version-footer">Loading version…</span>
+        <span class="footer-suite">
+          Suite:
+          <strong>migration-engine</strong>
+          · <a href="https://github.com/RobertLukan/proxmox-guestos-customization" target="_blank" rel="noopener noreferrer">proxmox-guestos-customization</a>
+          · <a href="https://github.com/RobertLukan/restore-engine" target="_blank" rel="noopener noreferrer">restore-engine</a>
+        </span>
       </footer>
     </main>
   </div>
@@ -948,8 +966,14 @@
       </p>
       </div>
     </main>
-    <footer class="app-footer" aria-label="Application version">
+    <footer class="app-footer" aria-label="Application version and related projects">
       <span id="app-version-footer">Loading version…</span>
+      <span class="footer-suite">
+        Suite:
+        <strong>migration-engine</strong>
+        · <a href="https://github.com/RobertLukan/proxmox-guestos-customization" target="_blank" rel="noopener noreferrer">proxmox-guestos-customization</a>
+        · <a href="https://github.com/RobertLukan/restore-engine" target="_blank" rel="noopener noreferrer">restore-engine</a>
+      </span>
     </footer>
   </div>
 

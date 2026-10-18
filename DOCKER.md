@@ -2,6 +2,8 @@
 
 Stack: **Redis**, **FastAPI UI + API**, **migration worker**. All three talk only on the internal Docker network except port **8000** published for the browser.
 
+**Published images:** each GitHub release builds and pushes [`ghcr.io/robertlukan/migration-engine`](https://github.com/RobertLukan/migration-engine/pkgs/container/migration-engine) (`:VERSION` and `:latest`, `linux/amd64`).
+
 ## Apple Silicon (M1/M2/M3) → Intel / AMD64 servers
 
 By default **`docker-compose.yml` sets `platform: linux/amd64`** so images match typical Linux x86_64 hosts. On a Mac ARM build, Docker uses **QEMU emulation** for that platform (slower builds; normal runtime on the Intel box).
