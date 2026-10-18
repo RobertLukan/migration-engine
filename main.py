@@ -399,8 +399,6 @@ class CreateJobRequest(BaseModel):
     memory_mb: int | None = Field(default=None, ge=512, le=1048576)
     cores: int | None = Field(default=None, ge=1, le=256)
     vlan: int | str | None = Field(default=None, description="Optional VLAN tag (1-4094) for guest net0")
-    winrm_user: str = Field(default="Administrator")
-    winrm_password: str = Field(default="")
     preimported_disk_mode: bool = Field(
         default=False,
         description=(
@@ -474,8 +472,6 @@ class MigrateSelectedRequest(BaseModel):
         description="Batch default VLAN tag (1-4094); per-VM vm_overrides.vlan wins when provided.",
     )
     proxmox_node: str | None = None
-    winrm_user: str = "Administrator"
-    winrm_password: str = ""
     import_mode: Literal["standard", "nfs"] = Field(
         default="standard",
         description=(
@@ -520,16 +516,6 @@ class EfiRedoEnqueueRequest(BaseModel):
         default=None,
         description="Storage for newly recreated efidisk0; default from proxmox.storage",
     )
-    run_guest_script: bool = Field(
-        default=False,
-        description="Run proxmox.efi_redo_guest_script via WinRM before EFI disk recreation.",
-    )
-    winrm_user: str = Field(default="Administrator")
-    winrm_password: str = Field(default="")
-    guest_script_override: str | None = Field(
-        default=None,
-        description="Optional PowerShell content override instead of proxmox.efi_redo_guest_script.",
-    )
 
 
 class JobRecord(BaseModel):
@@ -539,7 +525,6 @@ class JobRecord(BaseModel):
     proxmox_vmid: int
     proxmox_node: str
     vmdk_path_on_node: str
-    winrm_user: str
     proxmox_storage: str | None = None
     memory_mb: int | None = None
     cores: int | None = None
@@ -576,8 +561,6 @@ class VCenterEnqueueRequest(VCenterEnqueueFilters):
 
     proxmox_vmid_start: int = Field(..., ge=100)
     proxmox_node: str | None = None
-    winrm_user: str = "Administrator"
-    winrm_password: str = ""
 
 
 _cfg_boot = load_config()
@@ -588,7 +571,7 @@ if not _session_secret:
         "config.yaml must define ui.session_secret (random string) and ui.password (dashboard password)"
     )
 
-app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.1.0")
+app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.2.0")
 app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret,
@@ -1135,8 +1118,6 @@ def create_job(body: CreateJobRequest) -> JobRecord:
         "proxmox_vmid": str(body.proxmox_vmid),
         "proxmox_node": node,
         "vmdk_path_on_node": vmdk,
-        "winrm_user": body.winrm_user,
-        "winrm_password": body.winrm_password,
         "guest_ip": "",
         "error": "",
         "last_failed_stage": "",
@@ -1308,8 +1289,6 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
             "proxmox_storage": storage,
             "memory_mb": str(mem_mb),
             "cores": str(n_cores),
-            "winrm_user": body.winrm_user,
-            "winrm_password": body.winrm_password,
             "guest_ip": "",
             "error": "",
             "last_failed_stage": "",
@@ -1498,8 +1477,6 @@ def enqueue_efi_redo_pending(body: EfiRedoEnqueueRequest) -> dict[str, Any]:
             "proxmox_node": row["node"],
             "vmdk_path_on_node": "efi-redo:tagged",
             "proxmox_storage": store,
-            "winrm_user": body.winrm_user,
-            "winrm_password": body.winrm_password,
             "guest_ip": "",
             "error": "",
             "last_failed_stage": "",
@@ -1507,13 +1484,10 @@ def enqueue_efi_redo_pending(body: EfiRedoEnqueueRequest) -> dict[str, Any]:
             "updated_at": now,
             "preimported_disk_mode": "0",
             "take_snapshot": "0",
-            "run_guest_script": "1" if body.run_guest_script else "0",
             "firmware": "uefi",
             "guest_profile": "windows",
             "enable_vtpm": "0",
         }
-        if body.guest_script_override is not None:
-            mapping["efi_redo_guest_script_override"] = body.guest_script_override
         key = job_key(cfg, job_id)
         r.hset(key, mapping=mapping)
         r.rpush(cfg["redis"]["queue_key"], job_id)
@@ -1597,8 +1571,6 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
                 "proxmox_vmid": str(vmid),
                 "proxmox_node": node,
                 "vmdk_path_on_node": vmdk,
-                "winrm_user": body.winrm_user,
-                "winrm_password": body.winrm_password,
                 "guest_ip": "",
                 "error": "",
                 "last_failed_stage": "",
@@ -1809,7 +1781,7 @@ def _job_parallelism_api_fields(
             f"Same PVE ESXi linked-storage id ⇒ same permit bucket (cap {mc}). "
             "Matching bucket names in the jobs list share that limit. "
             "The permit applies only while Proxmox runs import-from (disk pull), not for the whole job — "
-            "other stages (boot, disk move, Horizon, etc.) can overlap between VMs."
+            "later stages (boot, guest-agent checks, etc.) can overlap between VMs."
         )
     else:
         parts.append(
@@ -1838,7 +1810,6 @@ def _hash_to_record(data: dict[str, str]) -> JobRecord:
         proxmox_vmid=int(data.get("proxmox_vmid", "0")),
         proxmox_node=data.get("proxmox_node", ""),
         vmdk_path_on_node=data.get("vmdk_path_on_node", ""),
-        winrm_user=data.get("winrm_user", "Administrator"),
         proxmox_storage=data.get("proxmox_storage") or None,
         memory_mb=_optional_int(data, "memory_mb"),
         cores=_optional_int(data, "cores"),

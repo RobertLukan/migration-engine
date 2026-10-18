@@ -10,8 +10,8 @@ class MigrationState(str, Enum):
     IMPORTING = "IMPORTING"
     SATA_BOOT = "SATA_BOOT"
     DRIVER_CHECK = "DRIVER_CHECK"
-    SCSI_SWAP = "SCSI_SWAP"
-    HORIZON_CONFIG = "HORIZON_CONFIG"
+    SCSI_SWAP = "SCSI_SWAP"  # legacy resume only
+    HORIZON_CONFIG = "HORIZON_CONFIG"  # legacy Redis jobs only; no longer used by the pipeline
     EFI_REDO = "EFI_REDO"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"

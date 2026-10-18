@@ -64,8 +64,6 @@ def test_post_jobs_with_explicit_vmdk_enqueues_and_writes_hash(
             "vmdk_path_on_node": "esxiStore:dc/ds/ApiGuest/ApiGuest.vmdk",
             "preimported_disk_mode": False,
             "take_snapshot": True,
-            "winrm_user": "Administrator",
-            "winrm_password": "",
         },
     )
     assert resp.status_code == 200, resp.text
@@ -140,8 +138,6 @@ def test_migrate_selected_409_when_guest_has_active_job(
             "proxmox_vmid": "3501",
             "proxmox_node": "pve",
             "vmdk_path_on_node": "esxiStore:dc/ds/BlockedGuest/BlockedGuest.vmdk",
-            "winrm_user": "Administrator",
-            "winrm_password": "",
             "guest_ip": "",
             "error": "",
             "last_failed_stage": "",
@@ -328,7 +324,7 @@ def test_enqueue_efi_redo_pending_enqueues_only_tagged_vms(
 
     resp = authed_client.post(
         "/jobs/efi-redo-pending",
-        json={"run_guest_script": False},
+        json={},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()

@@ -1,6 +1,5 @@
 """
-Redis-driven migration worker: Proxmox import directly to SCSI boot disk, first-boot guest-agent
-check, optional Horizon via WinRM (see RUN_HORIZON_WINRM_STAGE).
+Redis-driven migration worker: Proxmox import directly to SCSI boot disk, first-boot guest-agent check.
 Process **SIGTERM** / **SIGINT**: stop dequeuing, re-queue a popped job if not yet started, then drain the thread pool.
 
 v2.0+: concurrent imports across worker threads / replicas are limited per **Proxmox ESXi storage id**
@@ -1962,34 +1961,6 @@ def stage_driver_check_agent_ip(
     return ip
 
 
-def _run_winrm_powershell(
-    *,
-    cfg: dict[str, Any],
-    ip: str,
-    user: str,
-    password: str,
-    script: str,
-) -> None:
-    import winrm  # lazy: pywinrm import can hang on some hosts at process start
-
-    w = cfg["winrm"]
-    port = int(w.get("port", 5985))
-    scheme = "https" if port == 5986 else "http"
-    endpoint = f"{scheme}://{ip}:{port}/wsman"
-    session = winrm.Session(
-        endpoint,
-        auth=(user, password),
-        transport=w.get("transport", "ntlm"),
-        server_cert_validation=w.get("server_cert_validation", "ignore"),
-        operation_timeout_sec=int(w.get("operation_timeout_sec", 300)),
-        read_timeout_sec=int(w.get("read_timeout_sec", 600)),
-    )
-    result = session.run_ps(script)
-    if result.status_code != 0:
-        stderr = result.std_err.decode(errors="replace") if result.std_err else ""
-        raise RuntimeError(f"WinRM exit {result.status_code}: {stderr}")
-
-
 def stage_efi_redo_tagged_vm(
     r: redis.Redis,
     cfg: dict[str, Any],
@@ -1998,11 +1969,6 @@ def stage_efi_redo_tagged_vm(
     node: str,
     vmid: int,
     storage: str,
-    *,
-    run_guest_script: bool,
-    win_user: str,
-    win_pass: str,
-    guest_script_override: str,
 ) -> None:
     stage = MigrationState.EFI_REDO.value
     cancel = (r, cfg, job_id, stage)
@@ -2022,39 +1988,6 @@ def stage_efi_redo_tagged_vm(
             + ", ".join(need)
             + f" (missing: {', '.join(missing)})"
         )
-
-    if run_guest_script:
-        script = (guest_script_override or "").strip() or str(px.get("efi_redo_guest_script") or "").strip()
-        if not script:
-            raise RuntimeError(
-                "run_guest_script=true but no script provided; set proxmox.efi_redo_guest_script "
-                "or send guest_script_override"
-            )
-        if not win_user.strip():
-            raise RuntimeError("run_guest_script=true requires winrm_user")
-
-        def power_on() -> None:
-            st = proxmox.nodes(node).qemu(vmid).status.current.get()
-            if st.get("status") == "running":
-                return
-            proxmox.nodes(node).qemu(vmid).status.start.post()
-
-        hardware_change(r, cfg, job_id, stage, "power_on_for_guest_script", power_on)
-        ip = _wait_guest_agent_ipv4(
-            r,
-            cfg,
-            job_id,
-            stage,
-            proxmox,
-            node,
-            vmid,
-            cancel_poll=cancel,
-        )
-        r.hset(job_key(cfg, job_id), mapping={"guest_ip": ip, "updated_at": utc_now_iso()})
-        append_log(r, cfg, job_id, "INFO", stage, f"guest ip for EFI redo script: {ip}")
-        append_log(r, cfg, job_id, "INFO", stage, "winrm: run EFI redo guest script")
-        _run_winrm_powershell(cfg=cfg, ip=ip, user=win_user, password=win_pass, script=script)
-        append_log(r, cfg, job_id, "INFO", stage, "winrm: EFI redo guest script ok")
 
     def ensure_stopped() -> None:
         shutdown_or_stop_vm_retrying(
@@ -2103,121 +2036,47 @@ def stage_efi_redo_tagged_vm(
     hardware_change(r, cfg, job_id, stage, "update_efi_redo_tags", update_tags)
 
 
-# Horizon / Omnissa guest work via WinRM (``horizon.powershell_script``) is OFF while post-migrate steps
-# use Microsoft SCCM. Set True to restore optional guest WinRM script execution.
-RUN_HORIZON_WINRM_STAGE = False
-
-
-def stage_horizon_winrm(
+def _finish_migration_success(
     r: redis.Redis,
     cfg: dict[str, Any],
-    job_id: str,
     proxmox: ProxmoxAPI,
+    job_id: str,
     node: str,
     vmid: int,
-    ip: str,
-    user: str,
-    password: str,
+    *,
+    firmware: str,
+    log_stage: str,
 ) -> None:
-    cancel_hz = (r, cfg, job_id, MigrationState.HORIZON_CONFIG.value)
-
-    def power_on_after_scsi_swap() -> None:
-        st = proxmox.nodes(node).qemu(vmid).status.current.get()
-        if st.get("status") == "running":
-            return
-        proxmox.nodes(node).qemu(vmid).status.start.post()
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.HORIZON_CONFIG.value,
-        "power_on_after_scsi_swap",
-        power_on_after_scsi_swap,
-    )
-
-    def wait_guest_agent_after_scsi_boot() -> None:
-        wcfg = cfg.get("worker") or {}
-        raw_t = wcfg.get("post_scsi_swap_guest_agent_timeout_sec")
-        t_ovr: float | None = None
-        if raw_t not in (None, ""):
-            try:
-                t_ovr = float(raw_t)
-            except (TypeError, ValueError):
-                t_ovr = None
-        try:
-            ip2 = _wait_guest_agent_ipv4(
-                r,
-                cfg,
-                job_id,
-                MigrationState.HORIZON_CONFIG.value,
-                proxmox,
-                node,
-                vmid,
-                cancel_poll=cancel_hz,
-                timeout_sec=t_ovr,
-            )
-        except TimeoutError as err:
-            fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
-            raise MigrationAborted from err
-        r.hset(
-            job_key(cfg, job_id),
-            mapping={"guest_ip": ip2, "updated_at": utc_now_iso()},
+    """Apply post-migration tags and mark the job COMPLETED."""
+    try:
+        _apply_post_migration_tags(
+            r,
+            cfg,
+            proxmox,
+            job_id,
+            node,
+            vmid,
+            log_stage,
+            firmware=firmware,
         )
+    except Exception as tag_exc:
         append_log(
             r,
             cfg,
             job_id,
-            "INFO",
-            MigrationState.HORIZON_CONFIG.value,
-            f"guest agent up after SCSI boot; ip: {ip2}",
+            "WARNING",
+            log_stage,
+            f"post-migration VM tags failed (continuing): {tag_exc}",
         )
-
-    hardware_change(
+    set_state(r, cfg, job_id, MigrationState.COMPLETED)
+    append_log(
         r,
         cfg,
         job_id,
-        MigrationState.HORIZON_CONFIG.value,
-        "guest_agent_after_scsi_boot",
-        wait_guest_agent_after_scsi_boot,
+        "INFO",
+        MigrationState.COMPLETED.value,
+        "migration finished",
     )
-
-    ip = (r.hget(job_key(cfg, job_id), "guest_ip") or "").strip() or ip.strip()
-    if not ip:
-        err = RuntimeError("guest_ip missing after SCSI reboot guest-agent wait")
-        fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
-        raise MigrationAborted from err
-
-    w = cfg["winrm"]
-    port = int(w.get("port", 5985))
-    scheme = "https" if port == 5986 else "http"
-    endpoint = f"{scheme}://{ip}:{port}/wsman"
-    script = cfg.get("horizon", {}).get("powershell_script", "").strip()
-    if not script:
-        err = ValueError("horizon.powershell_script empty in config.yaml")
-        fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
-        raise MigrationAborted from err
-
-    try:
-        import winrm  # lazy: pywinrm import can hang on some hosts at process start
-
-        append_log(r, cfg, job_id, "INFO", MigrationState.HORIZON_CONFIG.value, "winrm: run horizon script")
-        session = winrm.Session(
-            endpoint,
-            auth=(user, password),
-            transport=w.get("transport", "ntlm"),
-            server_cert_validation=w.get("server_cert_validation", "ignore"),
-            operation_timeout_sec=int(w.get("operation_timeout_sec", 300)),
-            read_timeout_sec=int(w.get("read_timeout_sec", 600)),
-        )
-        result = session.run_ps(script)
-        if result.status_code != 0:
-            stderr = result.std_err.decode(errors="replace") if result.std_err else ""
-            raise RuntimeError(f"WinRM exit {result.status_code}: {stderr}")
-        append_log(r, cfg, job_id, "INFO", MigrationState.HORIZON_CONFIG.value, "winrm: horizon script ok")
-    except Exception as exc:
-        fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, exc)
-        raise MigrationAborted from exc
 
 
 def process_job(
@@ -2261,11 +2120,7 @@ def process_job(
     qemu_cpu_preset = qemu_cpu_preset_raw or None
     vlan_override_raw = (data.get("vlan") or "").strip()
     vlan_override = vlan_override_raw if vlan_override_raw else None
-    win_user = data.get("winrm_user") or "Administrator"
-    win_pass = data.get("winrm_password") or ""
     job_kind = (data.get("job_kind") or "").strip().lower()
-    run_guest_script = str(data.get("run_guest_script") or "").strip().lower() in ("1", "true", "yes", "on")
-    guest_script_override = (data.get("efi_redo_guest_script_override") or "").strip()
     preimported_mode = str(data.get("preimported_disk_mode") or "").strip().lower() in ("1", "true", "yes", "on")
     take_snapshot_raw = str(data.get("take_snapshot") or "").strip().lower()
     take_snapshot = take_snapshot_raw not in ("0", "false", "no", "off")
@@ -2294,10 +2149,6 @@ def process_job(
                     node,
                     vmid,
                     storage,
-                    run_guest_script=run_guest_script,
-                    win_user=win_user,
-                    win_pass=win_pass,
-                    guest_script_override=guest_script_override,
                 )
                 set_state(r, cfg, job_id, MigrationState.COMPLETED)
                 append_log(r, cfg, job_id, "INFO", MigrationState.COMPLETED.value, "efi redo workflow finished")
@@ -2478,14 +2329,17 @@ def process_job(
             return
 
         if state == MigrationState.DRIVER_CHECK:
-            ip = stage_driver_check_agent_ip(r, cfg, proxmox, job_id, node, vmid)
-            set_state(r, cfg, job_id, MigrationState.HORIZON_CONFIG)
-        else:
-            ip = data.get("guest_ip") or ""
-
-        data = r.hgetall(key)
-        state = MigrationState(data.get("state", MigrationState.SCSI_SWAP.value))
-        if state in (MigrationState.CANCELLED, MigrationState.FAILED):
+            stage_driver_check_agent_ip(r, cfg, proxmox, job_id, node, vmid)
+            _finish_migration_success(
+                r,
+                cfg,
+                proxmox,
+                job_id,
+                node,
+                vmid,
+                firmware=firmware,
+                log_stage=MigrationState.DRIVER_CHECK.value,
+            )
             return
 
         if state == MigrationState.SCSI_SWAP:
@@ -2498,88 +2352,39 @@ def process_job(
                 "Legacy SCSI_SWAP state detected from an older job definition; "
                 "direct-SCSI boot flow skips disk swap and continues.",
             )
-            set_state(r, cfg, job_id, MigrationState.HORIZON_CONFIG)
-
-        data = r.hgetall(key)
-        state = MigrationState(data.get("state", MigrationState.HORIZON_CONFIG.value))
-        if state in (MigrationState.CANCELLED, MigrationState.FAILED):
+            _finish_migration_success(
+                r,
+                cfg,
+                proxmox,
+                job_id,
+                node,
+                vmid,
+                firmware=firmware,
+                log_stage=MigrationState.SCSI_SWAP.value,
+            )
             return
 
         if state == MigrationState.HORIZON_CONFIG:
-            if not RUN_HORIZON_WINRM_STAGE:
-                append_log(
-                    r,
-                    cfg,
-                    job_id,
-                    "INFO",
-                    MigrationState.HORIZON_CONFIG.value,
-                    "HORIZON_CONFIG skipped (RUN_HORIZON_WINRM_STAGE=False); marking COMPLETED.",
-                )
-                try:
-                    _apply_post_migration_tags(
-                        r,
-                        cfg,
-                        proxmox,
-                        job_id,
-                        node,
-                        vmid,
-                        MigrationState.HORIZON_CONFIG.value,
-                        firmware=firmware,
-                    )
-                except Exception as tag_exc:
-                    append_log(
-                        r,
-                        cfg,
-                        job_id,
-                        "WARNING",
-                        MigrationState.HORIZON_CONFIG.value,
-                        f"post-migration VM tags failed (continuing): {tag_exc}",
-                    )
-                set_state(r, cfg, job_id, MigrationState.COMPLETED)
-                append_log(
-                    r,
-                    cfg,
-                    job_id,
-                    "INFO",
-                    MigrationState.COMPLETED.value,
-                    "migration finished",
-                )
-            else:
-                # --- Original Horizon / WinRM path (re-enable with RUN_HORIZON_WINRM_STAGE = True) ---
-                ip = (r.hget(key, "guest_ip") or "").strip() or ip
-                if not ip:
-                    ip = data.get("guest_ip") or ""
-                if not ip:
-                    err = RuntimeError("guest_ip missing before WinRM")
-                    fail_job(r, cfg, job_id, MigrationState.HORIZON_CONFIG.value, err)
-                    raise MigrationAborted from err
-                stage_horizon_winrm(
-                    r, cfg, job_id, proxmox, node, vmid, ip, win_user, win_pass
-                )
-                try:
-                    _apply_post_migration_tags(
-                        r,
-                        cfg,
-                        proxmox,
-                        job_id,
-                        node,
-                        vmid,
-                        MigrationState.HORIZON_CONFIG.value,
-                        firmware=firmware,
-                    )
-                except Exception as tag_exc:
-                    append_log(
-                        r,
-                        cfg,
-                        job_id,
-                        "WARNING",
-                        MigrationState.HORIZON_CONFIG.value,
-                        f"post-migration VM tags failed (continuing): {tag_exc}",
-                    )
-                set_state(r, cfg, job_id, MigrationState.COMPLETED)
-                append_log(
-                    r, cfg, job_id, "INFO", MigrationState.COMPLETED.value, "migration finished"
-                )
+            # Legacy Redis jobs only — pipeline no longer enters this state.
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                MigrationState.HORIZON_CONFIG.value,
+                "Legacy HORIZON_CONFIG state; completing migration (guest automation removed).",
+            )
+            _finish_migration_success(
+                r,
+                cfg,
+                proxmox,
+                job_id,
+                node,
+                vmid,
+                firmware=firmware,
+                log_stage=MigrationState.HORIZON_CONFIG.value,
+            )
+            return
 
     except MigrationAborted:
         log.info("Job %s stopped or aborted after a failed stage", job_id)

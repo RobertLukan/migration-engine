@@ -15,7 +15,6 @@ def _base_rec(**kwargs: Any) -> JobRecord:
         "proxmox_vmid": 3501,
         "proxmox_node": "pve",
         "vmdk_path_on_node": "sh12:dc/ds/vm/disk.vmdk",
-        "winrm_user": "Administrator",
     }
     d.update(kwargs)
     return JobRecord(**d)

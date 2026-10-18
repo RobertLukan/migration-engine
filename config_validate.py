@@ -11,14 +11,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-_DEFAULT_WINRM: dict[str, Any] = {
-    "port": 5985,
-    "transport": "ntlm",
-    "server_cert_validation": "ignore",
-    "operation_timeout_sec": 300,
-    "read_timeout_sec": 600,
-}
-
 
 class UiConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -71,22 +63,6 @@ class WorkerConfig(BaseModel):
     job_thread_pool_size: int = Field(default=24, ge=1, le=4096)
 
 
-class WinrmConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    port: int = Field(default=5985, ge=1, le=65535)
-    transport: str = "ntlm"
-    server_cert_validation: str = "ignore"
-    operation_timeout_sec: int = Field(default=300, ge=1, le=86400)
-    read_timeout_sec: int = Field(default=600, ge=1, le=86400)
-
-
-class HorizonConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    powershell_script: str = ""
-
-
 class MigrationEngineConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -95,8 +71,6 @@ class MigrationEngineConfig(BaseModel):
     proxmox: ProxmoxConfig
     vmware: VmwareConfig = Field(default_factory=VmwareConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
-    winrm: WinrmConfig = Field(default_factory=WinrmConfig)
-    horizon: HorizonConfig = Field(default_factory=HorizonConfig)
 
 
 def validate_loaded_config(data: Any) -> dict[str, Any]:
@@ -109,13 +83,9 @@ def validate_loaded_config(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError(f"config root must be a mapping, got {type(data).__name__}")
     merged: dict[str, Any] = dict(data)
-    if "winrm" not in merged or merged["winrm"] is None:
-        merged["winrm"] = dict(_DEFAULT_WINRM)
-    elif isinstance(merged["winrm"], dict):
-        wm = {**_DEFAULT_WINRM, **merged["winrm"]}
-        merged["winrm"] = wm
-    if "horizon" not in merged or merged["horizon"] is None:
-        merged["horizon"] = {}
+    # Drop removed top-level sections if present in older config.yaml files.
+    merged.pop("winrm", None)
+    merged.pop("horizon", None)
     if "worker" not in merged or merged["worker"] is None:
         merged["worker"] = {}
     if "vmware" not in merged or merged["vmware"] is None:

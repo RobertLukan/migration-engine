@@ -53,9 +53,6 @@ proxmox:
   # efi_redo_pending_tag: "efi-redo-pending"
   # efi_redo_migrated_tag: "migrated"
   # efi_redo_done_tag: "efi-redo-done"
-  # Optional PowerShell run inside guest before EFI disk recreation:
-  # efi_redo_guest_script: |
-  #   Write-Host "EFI prep steps here"
   # Production-style safety (see main config.yaml). For local Docker lab, leave commented or
   # match the VMIDs you enqueue. Ceph: use Proxmox storage id here, not only the Ceph pool name.
   # safety:
@@ -90,13 +87,3 @@ worker:
   pre_scsi_swap_scratch_disk_size: 2G
   post_first_boot_agent_grace_sec: 60
   post_scsi_swap_guest_agent_timeout_sec: 1800
-winrm:
-  port: 5985
-  transport: ntlm
-  server_cert_validation: ignore
-  operation_timeout_sec: 300
-  read_timeout_sec: 600
-horizon:
-  powershell_script: |
-    $ErrorActionPreference = 'Stop'
-    Write-Host 'Horizon script placeholder for lab image.'

@@ -1,6 +1,6 @@
 # Migration Engine
 
-VMware → Proxmox migration orchestrator (**v2.1.0**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, first-boot guest-agent check, and optional guest automation over WinRM.
+VMware → Proxmox migration orchestrator (**v2.2.0**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, then first-boot guest-agent checks.
 
 ## Intended use
 
@@ -8,7 +8,7 @@ Primary use: **Windows 11 VDI** (UEFI + vTPM by default). Recent **Windows Serve
 
 **Linux** guests can be migrated: choose SeaBIOS or UEFI to match the source, and **vTPM is not attached automatically** (only for UEFI + Windows unless you opt in). Forcing UEFI on a legacy-BIOS guest will not boot — prefer **importer-resolved** firmware from Proxmox VMX `import-metadata`, or override per VM in the Migrate dialog.
 
-## Features (v2.1)
+## Features (v2.2)
 
 - **Real ESXi → Proxmox import** via PVE `import-from` / linked ESXi storage (`auto-esxi` or path templates). Simulated template-clone import was removed.
 - **Firmware & guest profile from import-metadata** — the Migrate dialog can use Proxmox VMX `import-metadata` (BIOS type, guest hints, memory/cores) per VM, or **override** firmware/profile/vTPM in a per-VM matrix.
@@ -16,6 +16,7 @@ Primary use: **Windows 11 VDI** (UEFI + vTPM by default). Recent **Windows Serve
 - **vTPM policy** — attached by default for UEFI + Windows; SeaBIOS and Linux skip vTPM unless you opt in. SeaBIOS guests do not get `efi-redo-pending` post-migrate tags.
 - **Snapshot safety** — refuses import when the source folder still has VMware snapshot deltas (stale base VMDK).
 - **Operator feedback** — Migrate opens with an immediate busy state and loading banner while defaults/metadata load; enqueue shows progress while jobs are submitted.
+- **No WinRM / Horizon** — guest automation hooks and `pywinrm` were removed; the pipeline ends after guest-agent checks (post-migrate tags applied).
 - **Parallel imports** — Redis permit pools per ESXi storage bucket (see below).
 - **CPU presets** — keep imported CPU by default, or apply advanced `args=` presets (root helper required).
 
@@ -28,7 +29,7 @@ Primary use: **Windows 11 VDI** (UEFI + vTPM by default). Recent **Windows Serve
 - **Python** 3.10+ (3.11+ recommended)
 - **Redis** (job state, logs, queue, ESXi import permit pools)
 - **config.yaml** at the default path or pointed to by **`MIGRATION_ENGINE_CONFIG`**
-- Network reachability from the API host and the worker to **Proxmox** and (if used) **vCenter** and guests (**WinRM**)
+- Network reachability from the API host and the worker to **Proxmox** and (if used) **vCenter**
 
 `config.yaml` is validated at startup (API, worker, and dashboard credential loads). Invalid or incomplete config fails fast with a clear error instead of dying mid-migration.
 
@@ -71,7 +72,7 @@ This automation assumes Windows guests are prepared before migration:
 
 1. VirtIO/phantom device preparation is already done on the source VM so the guest can boot on Proxmox without the legacy SATA -> SCSI shuffle.
 2. VMware Tools are removed before migration (or handled by your existing pre-cutover process).
-3. Horizon agent uninstall/install/configuration is handled by your endpoint management workflow (in our case **Microsoft SCCM**) before/after cutover.
+3. Any VDI / agent lifecycle (uninstall/reinstall/configure) is handled outside this tool by your endpoint management workflow.
 4. **VMware snapshots are consolidated/removed on the source VM before migration** so the import captures the current disk state (see note below).
 
 Reference guide used by the team for this prep workflow:
@@ -84,9 +85,8 @@ If a source VM still has a VMware snapshot, its base VMDK (`vmname.vmdk`) is fro
 
 ## Scope notes
 
-- WinRM/Horizon hooks are optional and currently treated as placeholder integration points for future workflows.
 - Core migration path focuses on disk import and bootability on Proxmox with the prepared guest.
-- Horizon lifecycle handling (remove/reinstall/configure agent) is expected to be done externally (e.g., SCCM), not by this tool's default workflow.
+- Guest-side agent / VDI lifecycle work is expected to be done externally, not by this tool.
 
 ## CPU options (default vs advanced)
 
@@ -172,7 +172,7 @@ For deeper details and bucket strategy, see [`docs/IMPORT_PARALLELISM.md`](docs/
 ## Configuration
 
 - **Example / template:** [config.docker.example.yaml](config.docker.example.yaml)
-- **Horizon / WinRM / resume:** [docs/](docs/)
+- **Import parallelism:** [docs/IMPORT_PARALLELISM.md](docs/IMPORT_PARALLELISM.md)
 - **Ideas backlog:** [PRODUCT.md](PRODUCT.md)
 
 ## Tests

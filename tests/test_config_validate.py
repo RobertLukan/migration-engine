@@ -25,8 +25,8 @@ def test_validate_minimal_fixture_structure() -> None:
     }
     out = validate_loaded_config(raw)
     assert out["redis"]["url"] == "redis://127.0.0.1:6379/0"
-    assert "winrm" in out
-    assert out["winrm"]["port"] == 5985
+    assert "winrm" not in out
+    assert "horizon" not in out
 
 
 def test_validate_rejects_short_session_secret() -> None:
@@ -48,6 +48,19 @@ def test_validate_preserves_unknown_top_level_keys() -> None:
     }
     out = validate_loaded_config(raw)
     assert out.get("future_feature_flag") == {"x": 1}
+
+
+def test_validate_strips_removed_winrm_horizon_sections() -> None:
+    raw = {
+        "ui": {"password": "p", "session_secret": "1234567890123456"},
+        "redis": {"url": "redis://x", "queue_key": "q", "job_key_prefix": "j:", "job_log_suffix": ":log"},
+        "proxmox": {"host": "h"},
+        "winrm": {"port": 5985},
+        "horizon": {"powershell_script": "Write-Host hi"},
+    }
+    out = validate_loaded_config(raw)
+    assert "winrm" not in out
+    assert "horizon" not in out
 
 
 def test_validate_rejects_empty_proxmox_host() -> None:

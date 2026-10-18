@@ -108,8 +108,7 @@ docker compose up -d
 ## Notes
 
 - **Guest prep requirement (important):** This automation assumes Windows VMs were prepped on the source side (VirtIO/phantom-device approach) so boot works directly on Proxmox without a SATA -> SCSI swap loop, and that VMware Tools were removed pre-migration. Team reference: [croit guide](https://www.croit.io/blog/migrate-windows-vms-to-proxmox-ve).
-- **Horizon lifecycle prerequisite:** Horizon uninstall/install/configuration is expected to be handled externally (in our environment via **Microsoft SCCM**). WinRM/Horizon hooks in this tool are optional placeholders by default.
-- **Proxmox / VMware** still need reachability from the **worker** container to those networks (Docker bridge to LAN, macvlan/ipvlan, or host network if you change compose). **WinRM/Horizon hooks are optional placeholders** in this release; only require WinRM reachability if you explicitly enable guest scripts. This bundle does not embed Proxmox.
+- **Proxmox / VMware** still need reachability from the **worker** container to those networks (Docker bridge to LAN, macvlan/ipvlan, or host network if you change compose). This bundle does not embed Proxmox.
 - **`config.yaml`** in the repo is **not** copied into the image (`.dockerignore`) to avoid leaking real credentials; the image ships **`config.docker.example.yaml`** as `/app/config.docker.yaml`.
 - **Product / operator UX ideas** (job views, polling, bulk actions, versioning, etc.): see [`PRODUCT.md`](PRODUCT.md).
 - **Import parallelism tuning** (bucket model, worker scaling, rollout guidance): see [`docs/IMPORT_PARALLELISM.md`](docs/IMPORT_PARALLELISM.md).

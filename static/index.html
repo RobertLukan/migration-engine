@@ -595,7 +595,6 @@
               <li><a href="#help-features-ui">Dashboard &amp; UI</a></li>
               <li><a href="#help-features-technical">API &amp; worker</a></li>
               <li><a href="#help-import-permits">Import permits &amp; parallelism</a></li>
-              <li><a href="#help-horizon">Horizon / guest</a></li>
               <li><a href="#help-roadmap">Roadmap</a></li>
               <li><a href="#help-security">Security</a></li>
               <li><a href="#help-architecture">Architecture</a></li>
@@ -606,10 +605,9 @@
             <h4 id="help-overview">Overview</h4>
             <p>
               This dashboard drives a <strong>VMware → Proxmox</strong> migration pipeline: you pick guests, enqueue
-              jobs, and a <strong>worker</strong> (separate process) performs import, disk layout, reboots, and guest
-              steps. It fits <strong>batch / VDI-style</strong> moves when combined with your own Horizon / Omnissa guest
-              scripts in configuration. This project was created primarily for <strong>Windows 11 VDI</strong> migration,
-              but can also be used for recent <strong>Windows Server</strong> guests.
+              jobs, and a <strong>worker</strong> (separate process) performs import, firmware/devices, and guest-agent
+              checks. It fits <strong>batch / VDI-style</strong> moves. Primary use is <strong>Windows 11 VDI</strong>;
+              recent <strong>Windows Server</strong> and Linux guests are also supported.
             </p>
 
             <h4 id="help-workflow">Typical workflow</h4>
@@ -637,7 +635,7 @@
             <h4 id="help-features-technical">API, worker, safety &amp; deployment</h4>
             <ul>
               <li><strong>Safety</strong> — Optional <code>proxmox.safety</code> envelope (VMID range, storage allowlist, scratch purge naming) enforced on enqueue/worker.</li>
-              <li><strong>Worker pipeline</strong> — ESXi/NFS import-from to <code>scsi0</code>, firmware devices (EFI / vTPM when applicable), guest agent checks, optional configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
+              <li><strong>Worker pipeline</strong> — ESXi/NFS import-from to <code>scsi0</code>, firmware devices (EFI / vTPM when applicable), then guest-agent reachability checks.</li>
               <li><strong>REST</strong> — Authenticated <code>/jobs</code>, <code>/vms</code>, <code>/migration-defaults</code>, etc.; public <code>/health</code> and <code>/version</code>.</li>
               <li><strong>Deploy</strong> — Docker Compose stack documented (API + worker + optional Redis); nginx reverse-proxy notes.</li>
             </ul>
@@ -678,19 +676,8 @@
               Full detail: <code>docs/import-permits-and-parallelism.md</code> in this repository.
             </p>
 
-            <h4 id="help-horizon">Horizon / guest automation (today)</h4>
-            <p>
-              The WinRM/Horizon step is optional in this release and is commonly left as a placeholder script.
-              When enabled, the worker runs your <strong>PowerShell</strong> over WinRM from
-              <code>horizon.powershell_script</code> in <code>config.yaml</code>. There is <strong>no</strong> built-in
-              Connection Server REST client yet (pool moves, re-register to manual pool, etc. are design notes under
-              <code>docs/</code>).
-            </p>
-
             <h4 id="help-roadmap">Potential roadmap (ideas, not commitments)</h4>
             <ul>
-              <li><strong>Resume / retry</strong> — Operator-triggered resume when only the Horizon / WinRM stage failed (idempotent scripts).</li>
-              <li><strong>Horizon Connection Server API</strong> — Optional integration for manual pool registration, entitlements, inventory sync.</li>
               <li><strong>Preflight / dry-run</strong> — Validate enqueue inputs without starting destructive work.</li>
               <li><strong>Job metadata</strong> — Pool / wave labels for reporting; richer audit trail.</li>
               <li><strong>Live logs</strong> — SSE or WebSocket if log volume grows; split cheap vs deep health checks.</li>
@@ -699,27 +686,26 @@
 
             <h4 id="help-security">Security considerations</h4>
             <ul>
-              <li><strong>Exposure</strong> — Prefer private network or VPN; put the UI behind <strong>TLS</strong> (e.g. nginx). This tool drives Proxmox and guest automation; treat it as <strong>admin-tier</strong>.</li>
-              <li><strong>Secrets</strong> — <code>config.yaml</code> holds passwords and API tokens; restrict file permissions and backups. <strong>Redis</strong> holds job fields (including guest credentials used for WinRM); use ACLs, auth, and a dedicated DB index; protect Redis dumps.</li>
+              <li><strong>Exposure</strong> — Prefer private network or VPN; put the UI behind <strong>TLS</strong> (e.g. nginx). This tool drives Proxmox; treat it as <strong>admin-tier</strong>.</li>
+              <li><strong>Secrets</strong> — <code>config.yaml</code> holds passwords and API tokens; restrict file permissions and backups. <strong>Redis</strong> holds job state and logs; use ACLs, auth, and a dedicated DB index; protect Redis dumps.</li>
               <li><strong>Sessions</strong> — Single shared dashboard password; session cookie flags depend on app settings — see <code>SessionMiddleware</code> in code. Consider login rate limiting at nginx for internet-facing installs.</li>
               <li><strong>Public endpoints</strong> — <code>GET /health</code> and <code>GET /version</code> need no login; they can reveal coarse dependency status — restrict by network if that matters.</li>
               <li><strong>Infrastructure accounts</strong> — Use <strong>least privilege</strong> Proxmox tokens and VMware roles; keep <code>proxmox.safety</code> aligned with what those accounts may touch.</li>
-              <li><strong>Guest scripts</strong> — <code>horizon.powershell_script</code> runs with supplied WinRM credentials; treat script changes like production code (review, no secrets in logs, idempotent where possible).</li>
             </ul>
 
             <h4 id="help-architecture">Where things run</h4>
             <ul>
               <li><strong>This web app</strong> — FastAPI UI + API (browser or reverse proxy).</li>
-              <li><strong>Worker</strong> — Consumes Redis queue; talks to Proxmox API and guests (WinRM).</li>
+              <li><strong>Worker</strong> — Consumes Redis queue; talks to the Proxmox API (and optionally vCenter for inventory).</li>
               <li><strong>Redis</strong> — Job state, logs, queue (see deployment docs for host vs container Redis).</li>
             </ul>
 
             <h4 id="help-further-reading">Further reading</h4>
             <p class="hint" style="margin-bottom: 0">
               Repository files: <code>PRODUCT.md</code> (operator ideas), <code>DOCKER.md</code> / <code>NGINX.md</code>
-              (deploy), <code>docs/import-permits-and-parallelism.md</code> (import-from buckets &amp; parallelism),
-              <code>docs/HORIZON_*.md</code> (Horizon resume / Connection Server notes). The version line above is
-              loaded from <code>GET /version</code> (optional <code>MIGRATION_ENGINE_GIT_REVISION</code> env for build id).
+              (deploy), <code>docs/import-permits-and-parallelism.md</code> (import-from buckets &amp; parallelism).
+              The version line above is loaded from <code>GET /version</code> (optional
+              <code>MIGRATION_ENGINE_GIT_REVISION</code> env for build id).
             </p>
           </div>
           <div class="actions">
@@ -1348,7 +1334,6 @@
       "IMPORTING",
       "SATA_BOOT",
       "DRIVER_CHECK",
-      "HORIZON_CONFIG",
       "COMPLETED",
     ];
     const JOBS_POLL_VISIBLE_MS = 5000;
@@ -1356,6 +1341,7 @@
     function stateLabel(name) {
       if (name === "SATA_BOOT") return "PRE_BOOT_CHECK";
       if (name === "SCSI_SWAP") return "SCSI_SWAP (legacy)";
+      if (name === "HORIZON_CONFIG") return "HORIZON_CONFIG (legacy)";
       if (name === "EFI_REDO") return "EFI_REDO";
       return name;
     }
@@ -1364,16 +1350,14 @@
       const seq = [...MIGRATION_STATES];
       const s = String(state || "").trim();
       const f = normalizedFailedStage(lastFailed);
-      if (s === "EFI_REDO" || f === "EFI_REDO") {
-        const i = seq.indexOf("HORIZON_CONFIG");
-        if (i >= 0) seq.splice(i, 0, "EFI_REDO");
-        else seq.push("EFI_REDO");
-      }
-      if (s === "SCSI_SWAP" || f === "SCSI_SWAP") {
-        const i = seq.indexOf("HORIZON_CONFIG");
-        if (i >= 0) seq.splice(i, 0, "SCSI_SWAP");
-        else seq.push("SCSI_SWAP");
-      }
+      const insertBeforeCompleted = (name) => {
+        const i = seq.indexOf("COMPLETED");
+        if (i >= 0) seq.splice(i, 0, name);
+        else seq.push(name);
+      };
+      if (s === "EFI_REDO" || f === "EFI_REDO") insertBeforeCompleted("EFI_REDO");
+      if (s === "SCSI_SWAP" || f === "SCSI_SWAP") insertBeforeCompleted("SCSI_SWAP");
+      if (s === "HORIZON_CONFIG" || f === "HORIZON_CONFIG") insertBeforeCompleted("HORIZON_CONFIG");
       return seq;
     }
     let jobsPollTimer = null;
@@ -1427,9 +1411,9 @@
     function migrationProgress(state) {
       if (!state) return { pct: 0, cls: "" };
       if (state === "FAILED" || state === "CANCELLED") return { pct: 100, cls: "fail" };
-      if (state === "SCSI_SWAP") {
+      if (state === "SCSI_SWAP" || state === "HORIZON_CONFIG" || state === "EFI_REDO") {
         const denom = MIGRATION_STATES.length - 1;
-        const i = Math.max(0, MIGRATION_STATES.indexOf("HORIZON_CONFIG") - 0.5);
+        const i = Math.max(0, MIGRATION_STATES.indexOf("DRIVER_CHECK"));
         return { pct: Math.round((i / denom) * 100), cls: "" };
       }
       const i = MIGRATION_STATES.indexOf(state);

@@ -63,4 +63,3 @@ Potential concurrent imports = `2 + 2 + 2 = 6` (assuming enough workers and heal
 
 - This is controlled parallelism, not unlimited fan-out.
 - The safest way to speed up is spreading jobs across buckets and adding worker replicas gradually.
-- WinRM/Horizon placeholders do not affect import-throughput tuning.

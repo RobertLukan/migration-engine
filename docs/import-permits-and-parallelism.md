@@ -2,7 +2,7 @@
 
 ## Why this exists
 
-The heaviest step in a VMware → Proxmox move is usually **Proxmox `import-from`**: the hypervisor reads the source VMDK from ESXi-linked storage while creating the new VM disk. That phase stresses **ESXi and the data path** far more than later stages (SATA boot, driver check, SCSI swap, WinRM).
+The heaviest step in a VMware → Proxmox move is usually **Proxmox `import-from`**: the hypervisor reads the source VMDK from ESXi-linked storage while creating the new VM disk. That phase stresses **ESXi and the data path** far more than later stages (boot prep, guest-agent checks).
 
 The worker therefore uses a **Redis-backed import permit** so operators can cap **concurrent import-from operations per bucket**, instead of accidentally running many disk pulls at once.
 

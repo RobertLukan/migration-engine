@@ -8,7 +8,7 @@ Practical improvements that help **people running migrations** and **teams maint
 
 - **Job focus view** *(dashboard: “Details” on Migrations)* — Panel with **state timeline**, **last error**, **log tail** auto-refresh (~4s) while open, and **Copy diagnostics** (job id, VM name, node, VMID, state, failed stage, error, etc.).
 - **State as a timeline** — Same panel: ordered pipeline with done / current / error styling (and **CANCELLED** when applicable).
-- **Clearer failure context** — When a stage fails, show **which subsystem** (Proxmox API, guest agent, WinRM, queue) and **suggested next check** where you already know common causes.
+- **Clearer failure context** — When a stage fails, show **which subsystem** (Proxmox API, guest agent, queue) and **suggested next check** where you already know common causes.
 
 ## Performance & scale
 
@@ -31,10 +31,10 @@ Practical improvements that help **people running migrations** and **teams maint
 - **Stricter config at startup** — Validate `config.yaml` with a schema (e.g. Pydantic) so typos and missing keys fail **before** the first migration dies halfway.
 - **Split the dashboard script** — As `static/index.html` grows, moving JS into modules (even without a full SPA build) reduces merge pain and regression risk.
 
-## Guest-side work (Omnissa / WinRM / PowerShell)
+## Operator checks
 
 - **Stage timeouts** — Surface **how long** a step waited and **what timed out** in the UI.
-- **Dry-run / validate** — A path that checks **reachability and prerequisites** without mutating the guest reduces trial-and-error on production VMs.
+- **Dry-run / validate** — A path that checks **reachability and prerequisites** without starting destructive work reduces trial-and-error on production VMs.
 
 ---
 

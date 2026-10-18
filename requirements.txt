@@ -4,6 +4,5 @@ itsdangerous>=2.1.0
 redis>=5.0.0
 PyYAML>=6.0.1
 proxmoxer>=2.0.1
-pywinrm>=0.4.3
 pydantic>=2.6.0
 pyvmomi>=8.0.0
