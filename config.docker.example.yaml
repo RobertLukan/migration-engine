@@ -37,10 +37,12 @@ proxmox:
   memory_mb: 16384
   cores: 6
   ostype: win10
+  linux_ostype: l26
+  default_guest_profile: windows
+  default_firmware: uefi
+  # null = auto (UEFI+windows only); true/false = force
+  # default_enable_vtpm: null
   vmdk_path_template: auto-esxi
-  simulated_import: true
-  simulated_clone_source_vmid: 147
-  simulated_clone_source_node: ""
   efi_tpm_disk_format: raw
   efidisk0: ""
   import_disk_format: raw

@@ -52,7 +52,7 @@ def _seed_job(
             "updated_at": updated_at,
             "proxmox_vmid": "3501",
             "proxmox_node": "pve",
-            "vmdk_path_on_node": "simulated:clone",
+            "vmdk_path_on_node": "store:dc/ds/guest/guest.vmdk",
             "winrm_user": "Administrator",
             "winrm_password": "",
             "guest_ip": "",

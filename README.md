@@ -1,11 +1,23 @@
 # Migration Engine
 
-VMware → Proxmox migration orchestrator: FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, first-boot guest-agent check, and optional guest automation over WinRM.
+VMware → Proxmox migration orchestrator (**v2.1.0**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, first-boot guest-agent check, and optional guest automation over WinRM.
 
 ## Intended use
 
-This project was created primarily to assist migration of **Windows 11 VDI** workloads.
-It can also be used for migration of recent **Windows Server** guests.
+Primary use: **Windows 11 VDI** (UEFI + vTPM by default). Recent **Windows Server** guests are supported the same way.
+
+**Linux** guests can be migrated: choose SeaBIOS or UEFI to match the source, and **vTPM is not attached automatically** (only for UEFI + Windows unless you opt in). Forcing UEFI on a legacy-BIOS guest will not boot — prefer **importer-resolved** firmware from Proxmox VMX `import-metadata`, or override per VM in the Migrate dialog.
+
+## Features (v2.1)
+
+- **Real ESXi → Proxmox import** via PVE `import-from` / linked ESXi storage (`auto-esxi` or path templates). Simulated template-clone import was removed.
+- **Firmware & guest profile from import-metadata** — the Migrate dialog can use Proxmox VMX `import-metadata` (BIOS type, guest hints, memory/cores) per VM, or **override** firmware/profile/vTPM in a per-VM matrix.
+- **Per-VM resources** — RAM (MiB), vCPUs, and optional VLAN are set in the migrate matrix (defaults fall back to import-metadata, then `config.yaml`). Shared batch-only RAM/CPU/VLAN fields were removed from the UI.
+- **vTPM policy** — attached by default for UEFI + Windows; SeaBIOS and Linux skip vTPM unless you opt in. SeaBIOS guests do not get `efi-redo-pending` post-migrate tags.
+- **Snapshot safety** — refuses import when the source folder still has VMware snapshot deltas (stale base VMDK).
+- **Operator feedback** — Migrate opens with an immediate busy state and loading banner while defaults/metadata load; enqueue shows progress while jobs are submitted.
+- **Parallel imports** — Redis permit pools per ESXi storage bucket (see below).
+- **CPU presets** — keep imported CPU by default, or apply advanced `args=` presets (root helper required).
 
 ## Screenshot
 

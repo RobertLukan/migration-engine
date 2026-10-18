@@ -39,7 +39,7 @@ Health: **GET http://localhost:8000/health** (checks Redis).
 1. Copy `config.docker.example.yaml` to `config.docker.yaml`.
 2. Keep **`redis.url`** as **`redis://redis:6379/0`** (hostname must match the compose service name).
 3. Set **`ui.password`** and **`ui.session_secret`** (session secret must be non-empty; long random string).
-4. Uncomment the **`volumes`** lines under `api` and `worker` in `docker-compose.yml` so both processes read `./config.docker.yaml`.
+4. Compose already mounts `./config.docker.yaml` into both **api** and **worker** (required so Settings can save and the worker sees the same file).
 5. `docker compose up -d --build` if you changed the compose file only, or restart containers.
 
 ## Redis already on the server (host) vs Redis in Docker

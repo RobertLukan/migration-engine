@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import redis
-import winrm
 import yaml
 from proxmoxer import ProxmoxAPI
 
@@ -938,16 +937,21 @@ def _normalize_pve_tags(raw: Any) -> list[str]:
     return out
 
 
-def _post_migration_tags(cfg: dict[str, Any]) -> list[str]:
+def _post_migration_tags(cfg: dict[str, Any], *, firmware: str = "uefi") -> list[str]:
     """
     Tags to apply when migration reaches COMPLETED.
     - proxmox.post_migrate_tags unset -> default tracking tags.
     - proxmox.post_migrate_tags empty string / [] -> disable tagging.
+    - SeaBIOS guests never get efi-redo-pending (EFI redo is UEFI-only).
     """
     px = cfg.get("proxmox") or {}
     if "post_migrate_tags" not in px:
-        return ["migrated", "efi-redo-pending"]
-    return _normalize_pve_tags(px.get("post_migrate_tags"))
+        tags = ["migrated", "efi-redo-pending"]
+    else:
+        tags = _normalize_pve_tags(px.get("post_migrate_tags"))
+    if _normalize_firmware(firmware) == "seabios":
+        tags = [t for t in tags if t.lower() != "efi-redo-pending"]
+    return tags
 
 
 def _apply_post_migration_tags(
@@ -958,9 +962,11 @@ def _apply_post_migration_tags(
     node: str,
     vmid: int,
     stage: str,
+    *,
+    firmware: str = "uefi",
 ) -> None:
     """Best-effort VM tag update to track post-migration operator actions."""
-    wanted = _post_migration_tags(cfg)
+    wanted = _post_migration_tags(cfg, firmware=firmware)
     if not wanted:
         append_log(r, cfg, job_id, "INFO", stage, "post-migration VM tagging disabled by config")
         return
@@ -1213,13 +1219,67 @@ def _job_int(data: dict[str, str], key: str, default: int) -> int:
     return int(raw)
 
 
-def _job_simulated_import(data: dict[str, str], cfg: dict[str, Any]) -> bool:
-    raw = (data.get("simulated_import") or "").strip().lower()
+def _job_bool(data: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = str(data.get(key) or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
     if raw in ("0", "false", "no", "off"):
         return False
-    return bool((cfg.get("proxmox") or {}).get("simulated_import"))
+    return default
+
+
+def _normalize_firmware(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("uefi", "ovmf", "efi"):
+        return "uefi"
+    if k in ("seabios", "bios", "legacy"):
+        return "seabios"
+    return ""
+
+
+def _normalize_guest_profile(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("windows", "win"):
+        return "windows"
+    if k in ("linux", "l26", "other"):
+        return "linux"
+    return ""
+
+
+def _resolve_job_firmware_profile(data: dict[str, str], cfg: dict[str, Any]) -> tuple[str, str, bool]:
+    """
+    Returns (firmware, guest_profile, enable_vtpm).
+    Defaults: UEFI + windows; vTPM only when UEFI+windows unless job explicitly sets enable_vtpm.
+    """
+    px = cfg.get("proxmox") or {}
+    firmware = _normalize_firmware(data.get("firmware")) or _normalize_firmware(
+        str(px.get("default_firmware") or "")
+    ) or "uefi"
+    profile = _normalize_guest_profile(data.get("guest_profile")) or _normalize_guest_profile(
+        str(px.get("default_guest_profile") or "")
+    ) or "windows"
+
+    raw_tpm = str(data.get("enable_vtpm") or "").strip().lower()
+    if raw_tpm in ("1", "true", "yes", "on"):
+        enable_vtpm = True
+    elif raw_tpm in ("0", "false", "no", "off"):
+        enable_vtpm = False
+    else:
+        cfg_tpm = px.get("default_enable_vtpm")
+        if cfg_tpm is True:
+            enable_vtpm = True
+        elif cfg_tpm is False:
+            enable_vtpm = False
+        else:
+            enable_vtpm = firmware == "uefi" and profile == "windows"
+    return firmware, profile, enable_vtpm
+
+
+def _ostype_for_profile(cfg: dict[str, Any], profile: str) -> str:
+    px = cfg.get("proxmox") or {}
+    if profile == "linux":
+        return str(px.get("linux_ostype") or "l26").strip() or "l26"
+    return str(px.get("ostype") or "win10").strip() or "win10"
 
 
 def _import_disk_format(p: dict[str, Any], vmdk_path: str) -> str:
@@ -1286,6 +1346,123 @@ def _efi_tpm_disk_format(px: dict[str, Any]) -> str:
     return f
 
 
+def ensure_firmware_devices(
+    r: redis.Redis,
+    cfg: dict[str, Any],
+    proxmox: ProxmoxAPI,
+    job_id: str,
+    node: str,
+    vmid: int,
+    storage: str,
+    *,
+    firmware: str,
+    enable_vtpm: bool,
+) -> None:
+    """
+    Attach EFI vars disk and/or vTPM before first boot, based on firmware profile.
+    - SeaBIOS: neither device (unless enable_vtpm is forced — unusual).
+    - UEFI: efidisk0 always; tpmstate0 only when enable_vtpm is True.
+    Skips each device if already present.
+    """
+    px = cfg.get("proxmox") or {}
+    fmt = _efi_tpm_disk_format(px)
+    cancel_imp = (r, cfg, job_id, MigrationState.IMPORTING.value)
+    fw = _normalize_firmware(firmware) or "uefi"
+    want_efi = fw == "uefi"
+    want_tpm = bool(enable_vtpm)
+    cfg_now = get_qemu_config(proxmox, node, vmid)
+
+    if want_efi:
+        if not (cfg_now.get("efidisk0") or "").strip():
+            efispec = f"{storage}:1,format={fmt},efitype=4m,pre-enrolled-keys=1"
+
+            def add_efi() -> None:
+                append_log(
+                    r,
+                    cfg,
+                    job_id,
+                    "INFO",
+                    MigrationState.IMPORTING.value,
+                    f"efidisk0 (pre-enrolled keys): {efispec}",
+                )
+                resp = proxmox.nodes(node).qemu(vmid).config.post(efidisk0=efispec)
+                pve_check_api_response(resp, "efidisk0 preboot")
+                wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
+
+            hardware_change(
+                r,
+                cfg,
+                job_id,
+                MigrationState.IMPORTING.value,
+                "attach_efidisk0_preboot",
+                add_efi,
+            )
+        else:
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                MigrationState.IMPORTING.value,
+                "efidisk0 already present; skip automatic EFI disk",
+            )
+    else:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.IMPORTING.value,
+            "firmware=seabios: skipping efidisk0",
+        )
+
+    cfg_now = get_qemu_config(proxmox, node, vmid)
+    if want_tpm:
+        if not (cfg_now.get("tpmstate0") or "").strip():
+            tpmspec = f"{storage}:1,format={fmt},version=v2.0"
+
+            def add_tpm() -> None:
+                append_log(
+                    r,
+                    cfg,
+                    job_id,
+                    "INFO",
+                    MigrationState.IMPORTING.value,
+                    f"tpmstate0 (vTPM): {tpmspec}",
+                )
+                resp = proxmox.nodes(node).qemu(vmid).config.post(tpmstate0=tpmspec)
+                pve_check_api_response(resp, "tpmstate0 preboot")
+                wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
+
+            hardware_change(
+                r,
+                cfg,
+                job_id,
+                MigrationState.IMPORTING.value,
+                "attach_tpmstate0_preboot",
+                add_tpm,
+            )
+        else:
+            append_log(
+                r,
+                cfg,
+                job_id,
+                "INFO",
+                MigrationState.IMPORTING.value,
+                "tpmstate0 already present; skip automatic vTPM",
+            )
+    else:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.IMPORTING.value,
+            "vTPM not enabled for this job; skipping tpmstate0",
+        )
+
+
+# Backward-compatible alias for older call sites / tests.
 def ensure_ovmf_efidisk_and_vtpm(
     r: redis.Redis,
     cfg: dict[str, Any],
@@ -1295,83 +1472,17 @@ def ensure_ovmf_efidisk_and_vtpm(
     vmid: int,
     storage: str,
 ) -> None:
-    """
-    Add EFI vars disk (4m, pre-enrolled Secure Boot keys) and TPM state (v2.0) before the guest
-    is powered on. Skips each device if already present (e.g. cloned template).
-    """
-    px = cfg.get("proxmox") or {}
-    fmt = _efi_tpm_disk_format(px)
-    cancel_imp = (r, cfg, job_id, MigrationState.IMPORTING.value)
-    cfg_now = get_qemu_config(proxmox, node, vmid)
-
-    if not (cfg_now.get("efidisk0") or "").strip():
-        efispec = f"{storage}:1,format={fmt},efitype=4m,pre-enrolled-keys=1"
-
-        def add_efi() -> None:
-            append_log(
-                r,
-                cfg,
-                job_id,
-                "INFO",
-                MigrationState.IMPORTING.value,
-                f"efidisk0 (pre-enrolled keys): {efispec}",
-            )
-            resp = proxmox.nodes(node).qemu(vmid).config.post(efidisk0=efispec)
-            pve_check_api_response(resp, "efidisk0 preboot")
-            wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
-
-        hardware_change(
-            r,
-            cfg,
-            job_id,
-            MigrationState.IMPORTING.value,
-            "attach_efidisk0_preboot",
-            add_efi,
-        )
-    else:
-        append_log(
-            r,
-            cfg,
-            job_id,
-            "INFO",
-            MigrationState.IMPORTING.value,
-            "efidisk0 already present; skip automatic EFI disk",
-        )
-
-    cfg_now = get_qemu_config(proxmox, node, vmid)
-    if not (cfg_now.get("tpmstate0") or "").strip():
-        tpmspec = f"{storage}:1,format={fmt},version=v2.0"
-
-        def add_tpm() -> None:
-            append_log(
-                r,
-                cfg,
-                job_id,
-                "INFO",
-                MigrationState.IMPORTING.value,
-                f"tpmstate0 (vTPM): {tpmspec}",
-            )
-            resp = proxmox.nodes(node).qemu(vmid).config.post(tpmstate0=tpmspec)
-            pve_check_api_response(resp, "tpmstate0 preboot")
-            wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
-
-        hardware_change(
-            r,
-            cfg,
-            job_id,
-            MigrationState.IMPORTING.value,
-            "attach_tpmstate0_preboot",
-            add_tpm,
-        )
-    else:
-        append_log(
-            r,
-            cfg,
-            job_id,
-            "INFO",
-            MigrationState.IMPORTING.value,
-            "tpmstate0 already present; skip automatic vTPM",
-        )
+    ensure_firmware_devices(
+        r,
+        cfg,
+        proxmox,
+        job_id,
+        node,
+        vmid,
+        storage,
+        firmware="uefi",
+        enable_vtpm=True,
+    )
 
 
 def stage_import_vmdk_scsi0(
@@ -1386,13 +1497,28 @@ def stage_import_vmdk_scsi0(
     storage: str,
     memory_mb: int,
     cores: int,
+    *,
+    firmware: str = "uefi",
+    guest_profile: str = "windows",
+    enable_vtpm: bool = True,
 ) -> None:
     p = cfg["proxmox"]
-    ostype = p.get("ostype", "win10")
+    fw = _normalize_firmware(firmware) or "uefi"
+    profile = _normalize_guest_profile(guest_profile) or "windows"
+    ostype = _ostype_for_profile(cfg, profile)
+    bios = "ovmf" if fw == "uefi" else "seabios"
     disk_fmt = _import_disk_format(p, vmdk_path)
     cancel_imp = (r, cfg, job_id, MigrationState.IMPORTING.value)
 
     def create_shell() -> None:
+        append_log(
+            r,
+            cfg,
+            job_id,
+            "INFO",
+            MigrationState.IMPORTING.value,
+            f"create VM shell: bios={bios} ostype={ostype} profile={profile} vtpm={enable_vtpm}",
+        )
         resp = proxmox.nodes(node).qemu.post(
             vmid=vmid,
             name=vm_name,
@@ -1400,7 +1526,7 @@ def stage_import_vmdk_scsi0(
             cores=int(cores),
             sockets=1,
             ostype=ostype,
-            bios="ovmf",
+            bios=bios,
             machine="q35",
             scsihw="virtio-scsi-single",
             ide2="none,media=cdrom",
@@ -1410,7 +1536,14 @@ def stage_import_vmdk_scsi0(
         )
         pve_check_api_response(resp, "qemu create")
 
-    hardware_change(r, cfg, job_id, MigrationState.IMPORTING.value, "create_vm_q35_ovmf", create_shell)
+    hardware_change(
+        r,
+        cfg,
+        job_id,
+        MigrationState.IMPORTING.value,
+        f"create_vm_q35_{bios}",
+        create_shell,
+    )
 
     scsi_spec = f"{storage}:0,import-from={vmdk_path},format={disk_fmt}"
 
@@ -1455,7 +1588,17 @@ def stage_import_vmdk_scsi0(
         )
 
     hardware_change(r, cfg, job_id, MigrationState.IMPORTING.value, "import_vmdk_to_scsi0", attach_import)
-    ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+    ensure_firmware_devices(
+        r,
+        cfg,
+        proxmox,
+        job_id,
+        node,
+        vmid,
+        storage,
+        firmware=fw,
+        enable_vtpm=enable_vtpm,
+    )
 
 
 def stage_preimported_disk_to_scsi0(
@@ -1466,6 +1609,9 @@ def stage_preimported_disk_to_scsi0(
     node: str,
     vmid: int,
     storage: str,
+    *,
+    firmware: str = "uefi",
+    enable_vtpm: bool = True,
 ) -> None:
     """
     Pre-imported mode: VM shell + disk were prepared manually by operator (e.g. qm importdisk).
@@ -1473,6 +1619,7 @@ def stage_preimported_disk_to_scsi0(
     """
     stage = MigrationState.IMPORTING.value
     cancel_imp = (r, cfg, job_id, stage)
+    fw = _normalize_firmware(firmware) or "uefi"
 
     def ensure_vm_stopped() -> None:
         st = proxmox.nodes(node).qemu(vmid).status.current.get()
@@ -1503,7 +1650,17 @@ def stage_preimported_disk_to_scsi0(
             resp = proxmox.nodes(node).qemu(vmid).config.post(boot="order=scsi0")
             pve_check_api_response(resp, "preimported set boot order")
             wait_if_async(proxmox, cfg, node, resp, cancel_poll=cancel_imp)
-            ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+            ensure_firmware_devices(
+                r,
+                cfg,
+                proxmox,
+                job_id,
+                node,
+                vmid,
+                storage,
+                firmware=fw,
+                enable_vtpm=enable_vtpm,
+            )
             return
 
         src_key = ""
@@ -1539,7 +1696,17 @@ def stage_preimported_disk_to_scsi0(
         verify = get_qemu_config(proxmox, node, vmid)
         if not (verify.get("scsi0") or "").strip():
             raise RuntimeError("preimported mode: scsi0 missing after move from source disk slot")
-        ensure_ovmf_efidisk_and_vtpm(r, cfg, proxmox, job_id, node, vmid, storage)
+        ensure_firmware_devices(
+            r,
+            cfg,
+            proxmox,
+            job_id,
+            node,
+            vmid,
+            storage,
+            firmware=fw,
+            enable_vtpm=enable_vtpm,
+        )
 
     hardware_change(
         r,
@@ -1548,92 +1715,6 @@ def stage_preimported_disk_to_scsi0(
         stage,
         "preimported_disk_to_scsi0",
         normalize_disk_to_scsi0,
-    )
-
-
-def stage_simulated_clone(
-    r: redis.Redis,
-    cfg: dict[str, Any],
-    proxmox: ProxmoxAPI,
-    job_id: str,
-    target_node: str,
-    new_vmid: int,
-    vm_name: str,
-    storage: str,
-    source_vmid_override: int | None = None,
-) -> None:
-    """Full clone of a template VM on Proxmox instead of VMware import-from (testing / dry pipeline)."""
-    px = cfg.get("proxmox") or {}
-    source_vmid = int(
-        source_vmid_override
-        if source_vmid_override is not None
-        else px.get("simulated_clone_source_vmid", 147)
-    )
-    source_node = (px.get("simulated_clone_source_node") or "").strip() or target_node.strip()
-    cancel_imp = (r, cfg, job_id, MigrationState.IMPORTING.value)
-
-    try:
-        src_cfg = get_qemu_config(proxmox, source_node, source_vmid)
-        src_vmstate_storage = (src_cfg.get("vmstatestorage") or "").strip()
-        if src_vmstate_storage:
-            append_log(
-                r,
-                cfg,
-                job_id,
-                "INFO",
-                MigrationState.IMPORTING.value,
-                f"simulated clone preflight: source vmstatestorage={src_vmstate_storage!r}, target_storage={storage!r}",
-            )
-            if src_vmstate_storage != storage:
-                append_log(
-                    r,
-                    cfg,
-                    job_id,
-                    "WARNING",
-                    MigrationState.IMPORTING.value,
-                    "simulated clone preflight: source vmstatestorage differs from selected target storage; "
-                    "Proxmox may still require Datastore permissions on the source vmstatestorage.",
-                )
-    except Exception as exc:
-        append_log(
-            r,
-            cfg,
-            job_id,
-            "WARNING",
-            MigrationState.IMPORTING.value,
-            f"simulated clone preflight: could not inspect source VM config ({exc!r})",
-        )
-
-    def clone_vm() -> None:
-        append_log(
-            r,
-            cfg,
-            job_id,
-            "INFO",
-            MigrationState.IMPORTING.value,
-            "simulated import: "
-            f"qm clone from node={source_node!r} vmid={source_vmid} "
-            f"-> newid={new_vmid} name={vm_name!r} target_storage={storage!r}",
-        )
-        params: dict[str, Any] = {
-            "newid": new_vmid,
-            "name": vm_name,
-            "full": 1,
-            "storage": storage,
-        }
-        if target_node.strip() and target_node.strip() != source_node:
-            params["target"] = target_node.strip()
-        resp = proxmox.nodes(source_node).qemu(source_vmid).clone.post(**params)
-        pve_check_api_response(resp, "qm clone")
-        wait_if_async(proxmox, cfg, source_node, resp, cancel_poll=cancel_imp)
-
-    hardware_change(
-        r,
-        cfg,
-        job_id,
-        MigrationState.IMPORTING.value,
-        "simulated_clone",
-        clone_vm,
     )
 
 
@@ -1889,6 +1970,8 @@ def _run_winrm_powershell(
     password: str,
     script: str,
 ) -> None:
+    import winrm  # lazy: pywinrm import can hang on some hosts at process start
+
     w = cfg["winrm"]
     port = int(w.get("port", 5985))
     scheme = "https" if port == 5986 else "http"
@@ -2116,6 +2199,8 @@ def stage_horizon_winrm(
         raise MigrationAborted from err
 
     try:
+        import winrm  # lazy: pywinrm import can hang on some hosts at process start
+
         append_log(r, cfg, job_id, "INFO", MigrationState.HORIZON_CONFIG.value, "winrm: run horizon script")
         session = winrm.Session(
             endpoint,
@@ -2181,15 +2266,10 @@ def process_job(
     job_kind = (data.get("job_kind") or "").strip().lower()
     run_guest_script = str(data.get("run_guest_script") or "").strip().lower() in ("1", "true", "yes", "on")
     guest_script_override = (data.get("efi_redo_guest_script_override") or "").strip()
-    simulated = _job_simulated_import(data, cfg)
     preimported_mode = str(data.get("preimported_disk_mode") or "").strip().lower() in ("1", "true", "yes", "on")
     take_snapshot_raw = str(data.get("take_snapshot") or "").strip().lower()
     take_snapshot = take_snapshot_raw not in ("0", "false", "no", "off")
-    simulated_source_vmid = _job_int(
-        data,
-        "simulated_clone_source_vmid",
-        int(px_cfg.get("simulated_clone_source_vmid", 147)),
-    )
+    firmware, guest_profile, enable_vtpm = _resolve_job_firmware_profile(data, cfg)
 
     try:
         validate_job_vmid_and_storage(cfg, vmid, storage)
@@ -2235,29 +2315,15 @@ def process_job(
                     permit_state="NONE",
                 )
                 stage_preimported_disk_to_scsi0(
-                    r, cfg, proxmox, job_id, node, vmid, storage
-                )
-            elif simulated:
-                set_import_permit_status(
-                    r,
-                    cfg,
-                    job_id,
-                    bucket=None,
-                    permit_state="NONE",
-                )
-                stage_simulated_clone(
                     r,
                     cfg,
                     proxmox,
                     job_id,
                     node,
                     vmid,
-                    vm_name,
                     storage,
-                    simulated_source_vmid,
-                )
-                ensure_ovmf_efidisk_and_vtpm(
-                    r, cfg, proxmox, job_id, node, vmid, storage
+                    firmware=firmware,
+                    enable_vtpm=enable_vtpm,
                 )
             else:
                 bucket = resolve_esxi_import_permit_bucket(cfg, vmdk_path)
@@ -2360,6 +2426,9 @@ def process_job(
                         storage,
                         memory_mb,
                         cores,
+                        firmware=firmware,
+                        guest_profile=guest_profile,
+                        enable_vtpm=enable_vtpm,
                     )
                 finally:
                     if permit_list:
@@ -2455,6 +2524,7 @@ def process_job(
                         node,
                         vmid,
                         MigrationState.HORIZON_CONFIG.value,
+                        firmware=firmware,
                     )
                 except Exception as tag_exc:
                     append_log(
@@ -2495,6 +2565,7 @@ def process_job(
                         node,
                         vmid,
                         MigrationState.HORIZON_CONFIG.value,
+                        firmware=firmware,
                     )
                 except Exception as tag_exc:
                     append_log(
@@ -2518,7 +2589,16 @@ def process_job(
 
 
 def worker_loop(cfg: dict[str, Any]) -> None:
-    r = redis.from_url(cfg["redis"]["url"], decode_responses=True)
+    # socket_timeout must exceed BLPOP's block time. redis-py applies the command
+    # timeout to the socket; when the queue is empty, a 30s BLPOP + 30s socket
+    # timeout races and raises TimeoutError, which used to crash the process.
+    r = redis.from_url(
+        cfg["redis"]["url"],
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=60,
+        retry_on_timeout=True,
+    )
     q = cfg["redis"]["queue_key"]
     wcfg = cfg.get("worker") or {}
     try:
@@ -2590,7 +2670,12 @@ def worker_loop(cfg: dict[str, Any]) -> None:
                 wait(pending, timeout=10.0, return_when=FIRST_COMPLETED)
                 continue
 
-            item = r.blpop(q, timeout=30)
+            try:
+                item = r.blpop(q, timeout=25)
+            except (redis.exceptions.TimeoutError, TimeoutError, redis.exceptions.ConnectionError) as exc:
+                log.warning("Redis queue poll failed (%s); retrying", exc)
+                time.sleep(1)
+                continue
             if item is None:
                 continue
             _, job_id = item

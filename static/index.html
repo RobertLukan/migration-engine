@@ -122,6 +122,74 @@
     table.vm-table th { color: var(--muted); font-weight: 500; }
     .empty-state { color: var(--muted); padding: 1rem 0; }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.btn-busy {
+      opacity: 0.85;
+      cursor: wait;
+      pointer-events: none;
+    }
+    button.btn-busy::before {
+      content: "";
+      display: inline-block;
+      width: 0.75rem;
+      height: 0.75rem;
+      margin-right: 0.45rem;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      vertical-align: -0.1rem;
+      animation: btn-spin 0.7s linear infinite;
+    }
+    @keyframes btn-spin {
+      to { transform: rotate(360deg); }
+    }
+    #mig-enqueue-status {
+      margin: 0.5rem 0 0;
+      min-height: 1.2em;
+    }
+    #mig-modal-loading {
+      display: none;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 0.5rem 0 0.75rem;
+      padding: 0.55rem 0.7rem;
+      border-radius: 6px;
+      background: rgba(61, 139, 253, 0.12);
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+    #mig-modal-loading.show {
+      display: flex;
+    }
+    #mig-modal-loading::before {
+      content: "";
+      flex: 0 0 auto;
+      width: 0.85rem;
+      height: 0.85rem;
+      border: 2px solid rgba(61, 139, 253, 0.35);
+      border-top-color: var(--accent, #3d8bfd);
+      border-radius: 50%;
+      animation: btn-spin 0.7s linear infinite;
+    }
+    #migrate-modal.mig-loading .modal > :not(h3):not(#migrate-modal-summary):not(#mig-modal-loading) {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    /* Hide number spinners — accidental clicks were bumping memory/cores/VLAN by ±1. */
+    #mig-resources-matrix input.mig-res-ram,
+    #mig-resources-matrix input.mig-res-cores,
+    #mig-resources-matrix input.mig-res-vlan {
+      -moz-appearance: textfield;
+      appearance: textfield;
+    }
+    #mig-resources-matrix input.mig-res-ram::-webkit-outer-spin-button,
+    #mig-resources-matrix input.mig-res-ram::-webkit-inner-spin-button,
+    #mig-resources-matrix input.mig-res-cores::-webkit-outer-spin-button,
+    #mig-resources-matrix input.mig-res-cores::-webkit-inner-spin-button,
+    #mig-resources-matrix input.mig-res-vlan::-webkit-outer-spin-button,
+    #mig-resources-matrix input.mig-res-vlan::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
     tr.vm-row { cursor: pointer; }
     tr.vm-row:hover { background: rgba(61, 139, 253, 0.08); }
     tr.vm-row.selected { background: rgba(61, 139, 253, 0.12); }
@@ -560,7 +628,7 @@
                 list each guest (parallel import-from across different ids when permitted). <strong>Size</strong> uses
                 the listing&apos;s <code>size</code> field for the chosen disk.
               </li>
-              <li><strong>Migrate</strong> — Per-VM Proxmox VMID allocation, node, storage (dropdown + manual), RAM/CPU, optional QEMU CPU preset (nested/VBS), optional <strong>simulated import</strong> (clone template on PVE).</li>
+              <li><strong>Migrate</strong> — Per-VM Proxmox VMID allocation, node, storage, per-VM memory/cores (prefilled from PVE VMX import-metadata) and VLAN (operator-set), optional QEMU CPU preset, firmware mode (importer-resolved or per-VM override for UEFI/SeaBIOS, Windows/Linux, vTPM).</li>
               <li><strong>Migrations</strong> — Redis-backed states; list with progress bar; <strong>VMware / import queue</strong> (API host, import path, shared permit bucket for parallelism); <strong>Details</strong> (timeline, error, log tail with auto-refresh, copy diagnostics); <strong>Logs</strong> modal; <strong>Stop</strong>; <strong>bulk cancel</strong> for PENDING; polling slows when the browser tab is hidden.</li>
               <li><strong>Settings</strong> — Load/save <code>config.yaml</code> sections with masked secrets; test Proxmox and VMware connections.</li>
               <li><strong>Services strip</strong> — <code>GET /health</code>: config + Redis + Proxmox (required); VMware (optional, warning not red).</li>
@@ -569,7 +637,7 @@
             <h4 id="help-features-technical">API, worker, safety &amp; deployment</h4>
             <ul>
               <li><strong>Safety</strong> — Optional <code>proxmox.safety</code> envelope (VMID range, storage allowlist, scratch purge naming) enforced on enqueue/worker.</li>
-              <li><strong>Worker pipeline</strong> — Import / simulated clone, direct <code>scsi0</code> boot path, guest agent checks, optional configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
+              <li><strong>Worker pipeline</strong> — ESXi/NFS import-from to <code>scsi0</code>, firmware devices (EFI / vTPM when applicable), guest agent checks, optional configurable <strong>WinRM PowerShell</strong> (<code>horizon.powershell_script</code>) for guest/Omnissa steps.</li>
               <li><strong>REST</strong> — Authenticated <code>/jobs</code>, <code>/vms</code>, <code>/migration-defaults</code>, etc.; public <code>/health</code> and <code>/version</code>.</li>
               <li><strong>Deploy</strong> — Docker Compose stack documented (API + worker + optional Redis); nginx reverse-proxy notes.</li>
             </ul>
@@ -664,6 +732,9 @@
         <div class="modal" role="dialog" aria-labelledby="migrate-modal-title">
           <h3 id="migrate-modal-title">Migrate to Proxmox</h3>
           <p class="hint" id="migrate-modal-summary"></p>
+          <div id="mig-modal-loading" role="status" aria-live="polite">
+            <span class="mig-modal-loading-text">Loading import settings from Proxmox (VMX metadata, storage)…</span>
+          </div>
           <div id="mig-prior-warning" class="banner warn hidden" style="margin-top: 0.5rem"></div>
           <p class="hint" id="mig-vmdk-hint"></p>
           <label for="mig-vmid-start">First Proxmox VM ID</label>
@@ -678,12 +749,24 @@
           <p class="hint" id="mig-storage-hint">Loads from the API. Prefer entries marked OK for VM disks (ZFS, RBD, …). Disabled rows are greyed out.</p>
           <label for="mig-storage-manual">Or type a storage ID manually</label>
           <input id="mig-storage-manual" placeholder="Used if dropdown is empty or listing failed" />
-          <label for="mig-vlan">VLAN tag for guest net0 (optional)</label>
-          <input id="mig-vlan" type="number" min="1" max="4094" placeholder="Leave empty for untagged" />
-          <label for="mig-ram">Memory (MB)</label>
-          <input id="mig-ram" type="number" min="512" step="256" />
-          <label for="mig-cores">CPUs (cores)</label>
-          <input id="mig-cores" type="number" min="1" max="256" step="1" />
+          <label style="margin-top: 0.5rem">Per-VM memory, CPU &amp; VLAN</label>
+          <p class="hint" id="mig-resources-hint" style="margin-top: 0.25rem">
+            Memory and cores are prefilled from Proxmox VMX import-metadata when available (else config defaults). VLAN is never taken from the VMX — set it per VM here (empty = untagged).
+          </p>
+          <div id="mig-resources-matrix-wrap" style="margin-top: 0.5rem; overflow-x: auto">
+            <table class="data" id="mig-resources-matrix" style="width: 100%; font-size: 0.9rem">
+              <thead>
+                <tr>
+                  <th>VM</th>
+                  <th>Memory (MB)</th>
+                  <th>Cores</th>
+                  <th>VLAN</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody id="mig-resources-matrix-body"></tbody>
+            </table>
+          </div>
           <label style="margin-top: 0.5rem">Pre-boot snapshot</label>
           <div class="inline">
             <input type="radio" name="mig-take-snapshot" id="mig-snapshot-yes" value="yes" checked />
@@ -711,14 +794,37 @@
               Host CPU, nested virtualization enabled, VBS enabled
             </label>
           </fieldset>
-          <input type="hidden" id="mig-simulated" />
-          <input type="hidden" id="mig-sim-source-vmid" />
-          <div id="mig-sim-source-wrap" class="hidden"></div>
-          <p class="hint hidden" id="mig-simulated-hint"></p>
+          <label style="margin-top: 0.75rem">Firmware &amp; guest profile</label>
+          <div class="inline">
+            <input type="radio" name="mig-firmware-mode" id="mig-fw-importer" value="importer" checked />
+            <label for="mig-fw-importer" style="margin: 0">Use importer-resolved settings</label>
+          </div>
+          <div class="inline" style="margin-top: 0.25rem">
+            <input type="radio" name="mig-firmware-mode" id="mig-fw-override" value="override" />
+            <label for="mig-fw-override" style="margin: 0">Override per VM</label>
+          </div>
+          <p class="hint" id="mig-firmware-hint" style="margin-top: 0.25rem">
+            Importer mode reads UEFI vs SeaBIOS (and Windows/Linux hints) from Proxmox import-metadata on each guest&apos;s VMX. vTPM is suggested only for UEFI + Windows.
+          </p>
+          <div id="mig-fw-matrix-wrap" class="hidden" style="margin-top: 0.5rem; overflow-x: auto">
+            <table class="data" id="mig-fw-matrix" style="width: 100%; font-size: 0.9rem">
+              <thead>
+                <tr>
+                  <th>VM</th>
+                  <th>Profile</th>
+                  <th>Firmware</th>
+                  <th>vTPM</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody id="mig-fw-matrix-body"></tbody>
+            </table>
+          </div>
           <div class="actions">
             <button type="button" class="primary" id="btn-migrate-confirm">Enqueue migration</button>
             <button type="button" class="secondary" id="btn-migrate-cancel">Cancel</button>
           </div>
+          <p class="hint" id="mig-enqueue-status" aria-live="polite"></p>
         </div>
       </div>
 
@@ -1005,28 +1111,228 @@
 
     let lastMigrationDefaults = null;
     let lastVmdkHintText = "";
+    let lastFirmwareHintsByName = {};
 
-    function applyMigrateSimulatedToggle() {
-      const simCb = document.getElementById("mig-simulated");
-      const vmdkHint = document.getElementById("mig-vmdk-hint");
-      const hSim = document.getElementById("mig-simulated-hint");
-      const srcWrap = document.getElementById("mig-sim-source-wrap");
-      const srcInput = document.getElementById("mig-sim-source-vmid");
-      if (!simCb || !vmdkHint || !hSim || !srcWrap || !srcInput) return;
-      const vmid = lastMigrationDefaults ? lastMigrationDefaults.simulated_clone_source_vmid : 147;
-      if (simCb.checked) {
-        srcWrap.classList.remove("hidden");
-        if (!srcInput.value.trim()) srcInput.value = String(vmid);
-        vmdkHint.textContent =
-          "Simulated: VMware supplies guest names only. Proxmox clones template VM " +
-          srcInput.value.trim() +
-          ". No import-from.";
-        hSim.textContent =
-          "Clone workflow keeps the OS disk on scsi0 and runs the same direct-boot checks as a real import.";
+    function getMigrateFirmwareMode() {
+      const el = document.querySelector('input[name="mig-firmware-mode"]:checked');
+      return el && el.value === "override" ? "override" : "importer";
+    }
+
+    function syncMigrateFirmwareModeUi() {
+      const wrap = document.getElementById("mig-fw-matrix-wrap");
+      const hint = document.getElementById("mig-firmware-hint");
+      const mode = getMigrateFirmwareMode();
+      if (wrap) wrap.classList.toggle("hidden", mode !== "override");
+      if (hint) {
+        hint.textContent =
+          mode === "override"
+            ? "Edit firmware/profile/vTPM per VM below. Rows are prefilled from Proxmox import-metadata when available."
+            : "Importer mode reads UEFI vs SeaBIOS (and Windows/Linux hints) from Proxmox import-metadata on each guest's VMX. vTPM is suggested only for UEFI + Windows. Memory/cores/VLAN are set in the per-VM table above.";
+      }
+    }
+
+    function configFallbackRam() {
+      return (lastMigrationDefaults && lastMigrationDefaults.memory_mb) || 16384;
+    }
+
+    function configFallbackCores() {
+      return (lastMigrationDefaults && lastMigrationDefaults.cores) || 6;
+    }
+
+    function configFallbackVlan() {
+      // Only seed when config has a real VLAN tag. Empty / invalid must stay blank
+      // (type=number + min=1 otherwise often snaps empty fields to 1 on click).
+      if (!lastMigrationDefaults) return "";
+      const raw = lastMigrationDefaults.vlan;
+      if (raw === undefined || raw === null || String(raw).trim() === "") return "";
+      const n = parseInt(String(raw).trim(), 10);
+      if (!Number.isFinite(n) || n < 1 || n > 4094) return "";
+      return String(n);
+    }
+
+    function bindResourceMatrixInputGuards(root) {
+      if (!root) return;
+      root.querySelectorAll("input.mig-res-ram, input.mig-res-cores, input.mig-res-vlan").forEach((el) => {
+        // Mouse-wheel over a focused number input changes the value unintentionally.
+        el.addEventListener(
+          "wheel",
+          (ev) => {
+            if (document.activeElement === el) ev.preventDefault();
+          },
+          { passive: false }
+        );
+      });
+    }
+
+    function renderResourcesMatrix(names, byName) {
+      const tbody = document.getElementById("mig-resources-matrix-body");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      const defRam = configFallbackRam();
+      const defCores = configFallbackCores();
+      const defVlan = configFallbackVlan();
+      names.forEach((name) => {
+        const h = (byName && byName[name]) || {};
+        const mem =
+          typeof h.memory_mb === "number" && h.memory_mb >= 512 ? h.memory_mb : defRam;
+        const cores = typeof h.cores === "number" && h.cores >= 1 ? h.cores : defCores;
+        const source = h.source || "config-default";
+        const tr = document.createElement("tr");
+        tr.dataset.vmName = name;
+        const vlanAttr = defVlan ? ' value="' + escapeAttr(defVlan) + '"' : "";
+        tr.innerHTML =
+          "<td>" +
+          escapeHtml(name) +
+          "</td>" +
+          '<td><input type="number" class="mig-res-ram" min="512" step="1" value="' +
+          escapeAttr(String(mem)) +
+          '" style="width:6.5rem" /></td>' +
+          '<td><input type="number" class="mig-res-cores" min="1" max="256" step="1" value="' +
+          escapeAttr(String(cores)) +
+          '" style="width:4.5rem" /></td>' +
+          '<td><input type="text" class="mig-res-vlan" inputmode="numeric" autocomplete="off" placeholder="—"' +
+          vlanAttr +
+          ' style="width:4.5rem" /></td>' +
+          '<td class="hint" style="white-space:nowrap">' +
+          escapeHtml(String(source)) +
+          "</td>";
+        tbody.appendChild(tr);
+      });
+      bindResourceMatrixInputGuards(tbody);
+    }
+
+    function renderFirmwareMatrix(names, byName) {
+      const tbody = document.getElementById("mig-fw-matrix-body");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      const defs = lastMigrationDefaults || {};
+      names.forEach((name) => {
+        const h = (byName && byName[name]) || {};
+        const profile = h.guest_profile || defs.default_guest_profile || "windows";
+        const firmware = h.firmware || defs.default_firmware || "uefi";
+        const vtpm =
+          typeof h.enable_vtpm_suggested === "boolean"
+            ? h.enable_vtpm_suggested
+            : firmware === "uefi" && profile === "windows";
+        const source = h.source || "config-default";
+        const tr = document.createElement("tr");
+        tr.dataset.vmName = name;
+        tr.innerHTML =
+          "<td>" +
+          escapeHtml(name) +
+          "</td>" +
+          '<td><select class="mig-fw-profile">' +
+          '<option value="windows"' +
+          (profile === "windows" ? " selected" : "") +
+          ">windows</option>" +
+          '<option value="linux"' +
+          (profile === "linux" ? " selected" : "") +
+          ">linux</option></select></td>" +
+          '<td><select class="mig-fw-firmware">' +
+          '<option value="uefi"' +
+          (firmware === "uefi" ? " selected" : "") +
+          ">uefi</option>" +
+          '<option value="seabios"' +
+          (firmware === "seabios" ? " selected" : "") +
+          ">seabios</option></select></td>" +
+          '<td style="text-align:center"><input type="checkbox" class="mig-fw-vtpm"' +
+          (vtpm ? " checked" : "") +
+          " /></td>" +
+          '<td class="hint" style="white-space:nowrap">' +
+          escapeHtml(String(source)) +
+          "</td>";
+        tbody.appendChild(tr);
+        const profSel = tr.querySelector(".mig-fw-profile");
+        const fwSel = tr.querySelector(".mig-fw-firmware");
+        const vtpmCb = tr.querySelector(".mig-fw-vtpm");
+        const syncAutoVtpm = () => {
+          if (!vtpmCb.dataset.userTouched) {
+            vtpmCb.checked = fwSel.value === "uefi" && profSel.value === "windows";
+          }
+        };
+        profSel.addEventListener("change", syncAutoVtpm);
+        fwSel.addEventListener("change", syncAutoVtpm);
+        vtpmCb.addEventListener("change", () => {
+          vtpmCb.dataset.userTouched = "1";
+        });
+      });
+    }
+
+    function collectVmOverrides(firmwareMode) {
+      const out = {};
+      document.querySelectorAll("#mig-resources-matrix-body tr").forEach((tr) => {
+        const name = tr.dataset.vmName;
+        if (!name) return;
+        const ramEl = tr.querySelector(".mig-res-ram");
+        const coresEl = tr.querySelector(".mig-res-cores");
+        const vlanEl = tr.querySelector(".mig-res-vlan");
+        const ram = ramEl ? parseInt(ramEl.value, 10) : NaN;
+        const cores = coresEl ? parseInt(coresEl.value, 10) : NaN;
+        const vlanRaw = vlanEl ? vlanEl.value.trim() : "";
+        const row = {
+          memory_mb: Number.isFinite(ram) ? ram : configFallbackRam(),
+          cores: Number.isFinite(cores) ? cores : configFallbackCores(),
+          vlan: vlanRaw === "" ? null : parseInt(vlanRaw, 10),
+        };
+        if (row.vlan !== null && (!Number.isFinite(row.vlan) || row.vlan < 1 || row.vlan > 4094)) {
+          row.vlanInvalid = true;
+        }
+        out[name] = row;
+      });
+      if (firmwareMode === "override") {
+        document.querySelectorAll("#mig-fw-matrix-body tr").forEach((tr) => {
+          const name = tr.dataset.vmName;
+          if (!name) return;
+          const profile = tr.querySelector(".mig-fw-profile");
+          const firmware = tr.querySelector(".mig-fw-firmware");
+          const vtpm = tr.querySelector(".mig-fw-vtpm");
+          out[name] = out[name] || {};
+          out[name].guest_profile = profile ? profile.value : "windows";
+          out[name].firmware = firmware ? firmware.value : "uefi";
+          out[name].enable_vtpm = !!(vtpm && vtpm.checked);
+        });
+      }
+      return out;
+    }
+
+    async function loadFirmwareHintsForMigrate(names) {
+      lastFirmwareHintsByName = {};
+      try {
+        const node = (document.getElementById("mig-node").value || "").trim();
+        const body = { vm_names: names };
+        if (node) body.proxmox_node = node;
+        const res = await api("/api/ui/guest-import-hints", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        lastFirmwareHintsByName = res.by_name || {};
+      } catch (_) {
+        lastFirmwareHintsByName = {};
+      }
+      renderResourcesMatrix(names, lastFirmwareHintsByName);
+      renderFirmwareMatrix(names, lastFirmwareHintsByName);
+    }
+
+    function setMigrateEnqueueBusy(busy, statusText) {
+      const btn = document.getElementById("btn-migrate-confirm");
+      const cancel = document.getElementById("btn-migrate-cancel");
+      const status = document.getElementById("mig-enqueue-status");
+      if (!btn) return;
+      if (busy) {
+        if (!btn.dataset.idleLabel) btn.dataset.idleLabel = btn.textContent || "Enqueue migration";
+        btn.disabled = true;
+        btn.classList.add("btn-busy");
+        btn.setAttribute("aria-busy", "true");
+        btn.textContent = statusText || "Enqueueing…";
+        if (cancel) cancel.disabled = true;
+        if (status) status.textContent = statusText || "Creating jobs — this can take a few seconds…";
       } else {
-        srcWrap.classList.add("hidden");
-        vmdkHint.textContent = lastVmdkHintText || vmdkHint.textContent;
-        hSim.textContent = "";
+        btn.disabled = false;
+        btn.classList.remove("btn-busy");
+        btn.removeAttribute("aria-busy");
+        btn.textContent = btn.dataset.idleLabel || "Enqueue migration";
+        if (cancel) cancel.disabled = false;
+        if (status) status.textContent = "";
       }
     }
 
@@ -1260,7 +1566,9 @@
         "last_failed_stage: " + (j.last_failed_stage || ""),
         "guest_ip: " + (j.guest_ip || ""),
         "updated_at: " + (j.updated_at || ""),
-        "simulated_import: " + (j.simulated_import === true ? "true" : j.simulated_import === false ? "false" : ""),
+        "firmware: " + (j.firmware || ""),
+        "guest_profile: " + (j.guest_profile || ""),
+        "enable_vtpm: " + (j.enable_vtpm === true ? "true" : j.enable_vtpm === false ? "false" : ""),
         "take_snapshot: " + takeSnapshot,
         "vmware_api_host: " + (j.vmware_api_host || ""),
         "import_mode: " + (j.import_mode || ""),
@@ -1524,9 +1832,12 @@
         for (const j of jobs) {
           const pr = migrationProgress(j.state);
           const err = (j.error || "").trim();
-          const simTag = j.simulated_import ? "[Simulated] " : "";
+          const fwTag =
+            j.firmware || j.guest_profile
+              ? "[" + (j.firmware || "?") + "/" + (j.guest_profile || "?") + "] "
+              : "";
           const note =
-            simTag +
+            fwTag +
             (err || (j.guest_ip ? "IP: " + j.guest_ip : "") || (j.last_failed_stage || "") || "—");
           const terminal = ["COMPLETED", "FAILED", "CANCELLED"].indexOf(j.state) >= 0;
           const stopTitle = terminal ? "Migration finished — stop is not available" : "Stop this migration";
@@ -1896,6 +2207,54 @@
           w.classList.add("hidden");
           w.textContent = "";
         }
+        setMigrateModalLoading(false);
+        setMigrateOpenButtonBusy(false);
+        setMigrateEnqueueBusy(false);
+      }
+    }
+
+    function setMigrateModalLoading(busy, msg) {
+      const backdrop = document.getElementById("migrate-modal");
+      const bar = document.getElementById("mig-modal-loading");
+      if (backdrop) backdrop.classList.toggle("mig-loading", !!busy);
+      if (bar) {
+        bar.classList.toggle("show", !!busy);
+        if (msg) {
+          let textEl = bar.querySelector(".mig-modal-loading-text");
+          if (!textEl) {
+            [...bar.childNodes].forEach((n) => {
+              if (n.nodeType === 3) n.remove();
+            });
+            textEl = document.createElement("span");
+            textEl.className = "mig-modal-loading-text";
+            bar.appendChild(textEl);
+          }
+          textEl.textContent = msg;
+        }
+      }
+    }
+
+    function yieldForPaint() {
+      return new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+    }
+
+    function setMigrateOpenButtonBusy(busy) {
+      const btn = document.getElementById("btn-open-migrate-modal");
+      if (!btn) return;
+      if (busy) {
+        if (!btn.dataset.idleLabel) btn.dataset.idleLabel = btn.textContent || "Migrate selected…";
+        btn.disabled = true;
+        btn.classList.add("btn-busy");
+        btn.setAttribute("aria-busy", "true");
+        btn.textContent = "Preparing migrate…";
+      } else {
+        btn.classList.remove("btn-busy");
+        btn.removeAttribute("aria-busy");
+        btn.textContent = btn.dataset.idleLabel || "Migrate selected…";
+        // selection may still be empty — restore proper disabled state
+        updateMigrateButtonState();
       }
     }
 
@@ -1974,8 +2333,17 @@
     async function openMigrateModal() {
       const names = getSelectedVmNames();
       if (!names.length) return;
+      const openBtn = document.getElementById("btn-open-migrate-modal");
+      if (openBtn && openBtn.classList.contains("btn-busy")) return;
+      setMigrateOpenButtonBusy(true);
+      setMigrateModalLoading(
+        true,
+        "Loading import settings from Proxmox (VMX metadata, storage)…"
+      );
+      setMigrateModal(true);
       document.getElementById("migrate-modal-summary").textContent =
         names.length + " VM(s): " + names.slice(0, 5).join(", ") + (names.length > 5 ? "…" : "");
+      await yieldForPaint();
       const warnEl = document.getElementById("mig-prior-warning");
       if (warnEl) {
         const wl = buildMigratePriorWarningLines(names);
@@ -1994,113 +2362,104 @@
       let defStorage = "";
       let suggestedVmid = 3500;
       try {
-        const nodeForQuery = document.getElementById("mig-node").value.trim();
-        const defsUrl = nodeForQuery
-          ? `/migration-defaults?proxmox_node=${encodeURIComponent(nodeForQuery)}`
-          : "/migration-defaults";
-        const defs = await api(defsUrl);
-        lastMigrationDefaults = defs;
-        document.getElementById("mig-ram").value = defs.memory_mb || 16384;
-        document.getElementById("mig-cores").value = defs.cores || 6;
-        document.getElementById("mig-vlan").value =
-          defs.vlan !== undefined && defs.vlan !== null && String(defs.vlan).trim() !== ""
-            ? String(defs.vlan)
-            : "";
-        document.getElementById("mig-node").value = defs.default_node || "";
-        defStorage = (defs.storage || "").trim();
-        const tmpl = (defs.vmdk_path_template || "").trim();
-        if (defs.vmdk_template_auto_esxi) {
-          lastVmdkHintText =
-            "import-from auto-esxi: paths are taken from Proxmox ESXi storage listings (same source the import UI uses). " +
-            "vCenter is only used if PVE cannot list a match, or to validate the VM list when PVE does not list every guest. " +
-            "First selected VM: " +
-            names[0] +
-            ".";
-        } else if (tmpl) {
-          const ex = tmpl.replaceAll("{vm_name}", names[0]);
-          if (tmpl.toLowerCase().startsWith("esxi:")) {
+        try {
+          const nodeForQuery = document.getElementById("mig-node").value.trim();
+          const defsUrl = nodeForQuery
+            ? `/migration-defaults?proxmox_node=${encodeURIComponent(nodeForQuery)}`
+            : "/migration-defaults";
+          const defs = await api(defsUrl);
+          lastMigrationDefaults = defs;
+          document.getElementById("mig-node").value = defs.default_node || "";
+          defStorage = (defs.storage || "").trim();
+          const tmpl = (defs.vmdk_path_template || "").trim();
+          if (defs.vmdk_template_auto_esxi) {
             lastVmdkHintText =
-              "import-from uses your linked ESXi storage in Proxmox (PVE reads the disk from ESXi; no copy to the node). " +
-              "Template: " +
-              tmpl +
-              " — first VM resolves to: " +
-              ex +
-              ". Adjust folders/datacenter in config if inventory paths differ per VM.";
+              "import-from auto-esxi: paths are taken from Proxmox ESXi storage listings (same source the import UI uses). " +
+              "vCenter is only used if PVE cannot list a match, or to validate the VM list when PVE does not list every guest. " +
+              "First selected VM: " +
+              names[0] +
+              ".";
+          } else if (tmpl) {
+            const ex = tmpl.replaceAll("{vm_name}", names[0]);
+            if (tmpl.toLowerCase().startsWith("esxi:")) {
+              lastVmdkHintText =
+                "import-from uses your linked ESXi storage in Proxmox (PVE reads the disk from ESXi; no copy to the node). " +
+                "Template: " +
+                tmpl +
+                " — first VM resolves to: " +
+                ex +
+                ". Adjust folders/datacenter in config if inventory paths differ per VM.";
+            } else {
+              lastVmdkHintText =
+                "Each job uses import-from on the Proxmox node filesystem (vCenter is not contacted for the disk). " +
+                "Template: " +
+                tmpl +
+                " — first VM expects file: " +
+                ex +
+                ". Copy the exported .vmdk there or change the template.";
+            }
           } else {
             lastVmdkHintText =
-              "Each job uses import-from on the Proxmox node filesystem (vCenter is not contacted for the disk). " +
-              "Template: " +
-              tmpl +
-              " — first VM expects file: " +
-              ex +
-              ". Copy the exported .vmdk there or change the template.";
+              "Set proxmox.vmdk_path_template in config.yaml: auto-esxi, or {vm_name} template, or an esxi:… URI if ESXi is linked in PVE.";
           }
-        } else {
+          vmdkHint.textContent = lastVmdkHintText;
+          const savedCpu = sessionStorage.getItem("migCpuPreset");
+          const enableCpuPreset = !!savedCpu && savedCpu !== "none";
+          document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
+          document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
+            el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
+          });
+          syncMigrateCpuPresetUi();
+          if (defs.migration_vmid_min != null) suggestedVmid = defs.migration_vmid_min;
+          if (defs.next_free_proxmox_vmid != null)
+            suggestedVmid = Math.max(suggestedVmid, defs.next_free_proxmox_vmid);
+          const mh = document.getElementById("mig-vmid-hint");
+          if (mh && defs.migration_vmid_min != null && defs.migration_vmid_max != null) {
+            mh.textContent =
+              "Configured migration VMID range: " +
+              defs.migration_vmid_min +
+              "–" +
+              defs.migration_vmid_max +
+              ". Each selected VM gets the next free ID from your start value.";
+          }
+        } catch (_) {
+          lastMigrationDefaults = null;
           lastVmdkHintText =
-            "Set proxmox.vmdk_path_template in config.yaml: auto-esxi, or {vm_name} template, or an esxi:… URI if ESXi is linked in PVE.";
+            "Could not load migration defaults; check proxmox.vmdk_path_template (host path or esxi:…) before enqueueing.";
+          vmdkHint.textContent = lastVmdkHintText;
+          const savedCpu = sessionStorage.getItem("migCpuPreset");
+          const enableCpuPreset = !!savedCpu && savedCpu !== "none";
+          document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
+          document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
+            el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
+          });
+          syncMigrateCpuPresetUi();
         }
-        vmdkHint.textContent = lastVmdkHintText;
-        const simCb = document.getElementById("mig-simulated");
-        const simSrc = document.getElementById("mig-sim-source-vmid");
-        simCb.checked = false;
-        simSrc.value = "";
-        const savedCpu = sessionStorage.getItem("migCpuPreset");
-        const enableCpuPreset = !!savedCpu && savedCpu !== "none";
-        document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
-        document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
-          el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
-        });
-        syncMigrateCpuPresetUi();
-        if (defs.migration_vmid_min != null) suggestedVmid = defs.migration_vmid_min;
-        if (defs.next_free_proxmox_vmid != null)
-          suggestedVmid = Math.max(suggestedVmid, defs.next_free_proxmox_vmid);
-        const mh = document.getElementById("mig-vmid-hint");
-        if (mh && defs.migration_vmid_min != null && defs.migration_vmid_max != null) {
-          mh.textContent =
-            "Configured migration VMID range: " +
-            defs.migration_vmid_min +
-            "–" +
-            defs.migration_vmid_max +
-            ". Each selected VM gets the next free ID from your start value.";
+        const savedSnapshot = sessionStorage.getItem("migTakeSnapshot");
+        const takeSnapshot = savedSnapshot === null ? true : savedSnapshot !== "0";
+        document.getElementById("mig-snapshot-yes").checked = takeSnapshot;
+        document.getElementById("mig-snapshot-no").checked = !takeSnapshot;
+        const savedFwMode = sessionStorage.getItem("migFirmwareMode");
+        document.getElementById("mig-fw-importer").checked = savedFwMode !== "override";
+        document.getElementById("mig-fw-override").checked = savedFwMode === "override";
+        syncMigrateFirmwareModeUi();
+        await loadFirmwareHintsForMigrate(names);
+        await loadProxmoxStorageDropdown();
+        preselectStorageFromDefault(defStorage);
+        const migVmidInput = document.getElementById("mig-vmid-start");
+        if (lastMigrationDefaults && lastMigrationDefaults.migration_vmid_min != null) {
+          migVmidInput.min = String(lastMigrationDefaults.migration_vmid_min);
+        } else {
+          migVmidInput.min = "100";
         }
-      } catch (_) {
-        lastMigrationDefaults = null;
-        document.getElementById("mig-ram").value = 16384;
-        document.getElementById("mig-cores").value = 6;
-        document.getElementById("mig-vlan").value = "";
-        lastVmdkHintText =
-          "Could not load migration defaults; check proxmox.vmdk_path_template (host path or esxi:…) before enqueueing.";
-        vmdkHint.textContent = lastVmdkHintText;
-        const simCb = document.getElementById("mig-simulated");
-        const simSrc = document.getElementById("mig-sim-source-vmid");
-        simCb.checked = false;
-        simSrc.value = "";
-        const savedCpu = sessionStorage.getItem("migCpuPreset");
-        const enableCpuPreset = !!savedCpu && savedCpu !== "none";
-        document.getElementById("mig-enable-cpu-preset").checked = enableCpuPreset;
-        document.querySelectorAll('input[name="mig-cpu-preset"]').forEach((el) => {
-          el.checked = enableCpuPreset ? el.value === savedCpu : el.value === "host_no_nested";
-        });
-        syncMigrateCpuPresetUi();
+        const savedStart = sessionStorage.getItem("migVmidStart");
+        let startNum = savedStart !== null && savedStart !== "" ? parseInt(savedStart, 10) : suggestedVmid;
+        if (!Number.isFinite(startNum)) startNum = suggestedVmid;
+        migVmidInput.value = String(startNum);
+      } finally {
+        setMigrateModalLoading(false);
+        setMigrateOpenButtonBusy(false);
       }
-      const savedSnapshot = sessionStorage.getItem("migTakeSnapshot");
-      const takeSnapshot = savedSnapshot === null ? true : savedSnapshot !== "0";
-      document.getElementById("mig-snapshot-yes").checked = takeSnapshot;
-      document.getElementById("mig-snapshot-no").checked = !takeSnapshot;
-      applyMigrateSimulatedToggle();
-      await loadProxmoxStorageDropdown();
-      preselectStorageFromDefault(defStorage);
-      const migVmidInput = document.getElementById("mig-vmid-start");
-      if (lastMigrationDefaults && lastMigrationDefaults.migration_vmid_min != null) {
-        migVmidInput.min = String(lastMigrationDefaults.migration_vmid_min);
-      } else {
-        migVmidInput.min = "100";
-      }
-      const savedStart = sessionStorage.getItem("migVmidStart");
-      let startNum = savedStart !== null && savedStart !== "" ? parseInt(savedStart, 10) : suggestedVmid;
-      if (!Number.isFinite(startNum)) startNum = suggestedVmid;
-      migVmidInput.value = String(startNum);
-      setMigrateModal(true);
     }
 
     async function applyGate() {
@@ -2501,12 +2860,15 @@
     };
     document.getElementById("btn-open-migrate-modal").onclick = () => openMigrateModal();
     document.getElementById("btn-enqueue-efi-redo").onclick = () => enqueueEfiRedoTagged();
-    document.getElementById("mig-simulated").addEventListener("change", () => applyMigrateSimulatedToggle());
-    document.getElementById("mig-enable-cpu-preset").addEventListener("change", () => syncMigrateCpuPresetUi());
-    document.getElementById("mig-sim-source-vmid").addEventListener("input", () => {
-      if (document.getElementById("mig-simulated").checked) applyMigrateSimulatedToggle();
+    document.querySelectorAll('input[name="mig-firmware-mode"]').forEach((el) => {
+      el.addEventListener("change", () => syncMigrateFirmwareModeUi());
     });
-    document.getElementById("mig-node").addEventListener("change", () => loadProxmoxStorageDropdown());
+    document.getElementById("mig-enable-cpu-preset").addEventListener("change", () => syncMigrateCpuPresetUi());
+    document.getElementById("mig-node").addEventListener("change", () => {
+      loadProxmoxStorageDropdown();
+      const names = getSelectedVmNames();
+      if (names.length) loadFirmwareHintsForMigrate(names);
+    });
     document.getElementById("mig-node").addEventListener("blur", () => loadProxmoxStorageDropdown());
     document.getElementById("btn-migrate-cancel").onclick = () => setMigrateModal(false);
     document.getElementById("migrate-modal").addEventListener("click", (e) => {
@@ -2514,24 +2876,43 @@
     });
     document.getElementById("btn-migrate-confirm").onclick = async () => {
       const gb = document.getElementById("global-banner");
+      const btn = document.getElementById("btn-migrate-confirm");
+      if (btn && btn.classList.contains("btn-busy")) return;
       const names = getSelectedVmNames();
       const vmid = parseInt(document.getElementById("mig-vmid-start").value, 10);
       const storage = getMigrateStorageValue();
-      const ram = parseInt(document.getElementById("mig-ram").value, 10);
-      const cores = parseInt(document.getElementById("mig-cores").value, 10);
-      const vlanRaw = document.getElementById("mig-vlan").value.trim();
-      const vlan = vlanRaw === "" ? null : parseInt(vlanRaw, 10);
       const node = document.getElementById("mig-node").value.trim();
-      const isSimulated = false;
       const takeSnapshot = !!document.getElementById("mig-snapshot-yes").checked;
-      if (!names.length || !storage || !Number.isFinite(vmid) || vmid < 100 || !Number.isFinite(ram) || !Number.isFinite(cores)) {
-        banner(gb, "err", "Fill all required fields (VM ID ≥ 100, storage, RAM, cores).");
+      const firmware_mode = getMigrateFirmwareMode();
+      if (!names.length || !storage || !Number.isFinite(vmid) || vmid < 100) {
+        banner(gb, "err", "Fill all required fields (VM ID ≥ 100, storage).");
         return;
       }
-      if (vlanRaw !== "" && (!Number.isFinite(vlan) || vlan < 1 || vlan > 4094)) {
-        banner(gb, "err", "Set VLAN between 1 and 4094, or leave it empty.");
-        return;
+      const overrides = collectVmOverrides(firmware_mode);
+      for (const n of names) {
+        const row = overrides[n];
+        if (!row) {
+          banner(gb, "err", "Per-VM resources table is missing a row for " + n + ". Re-open the migrate dialog.");
+          return;
+        }
+        if (row.vlanInvalid) {
+          banner(gb, "err", "VLAN for " + n + " must be 1–4094 or empty.");
+          return;
+        }
+        if (!Number.isFinite(row.memory_mb) || row.memory_mb < 512) {
+          banner(gb, "err", "Memory for " + n + " must be at least 512 MB.");
+          return;
+        }
+        if (!Number.isFinite(row.cores) || row.cores < 1) {
+          banner(gb, "err", "Cores for " + n + " must be at least 1.");
+          return;
+        }
+        delete row.vlanInvalid;
       }
+      // API still requires batch memory/cores; use first selected row (per-VM overrides win per job).
+      const firstRow = overrides[names[0]];
+      const ram = firstRow.memory_mb;
+      const cores = firstRow.cores;
       const enableCpuPreset = document.getElementById("mig-enable-cpu-preset").checked;
       const cpuEl = document.querySelector('input[name="mig-cpu-preset"]:checked');
       const qemu_cpu_preset = enableCpuPreset && cpuEl ? cpuEl.value : null;
@@ -2541,17 +2922,18 @@
         proxmox_storage: storage,
         memory_mb: ram,
         cores: cores,
-        simulated_import: isSimulated,
         import_mode: "standard",
         take_snapshot: takeSnapshot,
+        firmware_mode: firmware_mode,
+        vm_overrides: overrides,
       };
       if (qemu_cpu_preset) body.qemu_cpu_preset = qemu_cpu_preset;
-      if (vlanRaw !== "") body.vlan = vlan;
       if (node) body.proxmox_node = node;
+      setMigrateEnqueueBusy(true, "Enqueueing " + names.length + " job(s)…");
       try {
         const res = await api("/jobs/migrate-selected", { method: "POST", body: JSON.stringify(body) });
         sessionStorage.setItem("migVmidStart", String(res.next_proxmox_vmid));
-        sessionStorage.setItem("migSimulated", "0");
+        sessionStorage.setItem("migFirmwareMode", firmware_mode);
         sessionStorage.setItem("migCpuPreset", qemu_cpu_preset || "none");
         sessionStorage.setItem("migTakeSnapshot", takeSnapshot ? "1" : "0");
         setMigrateModal(false);
@@ -2575,6 +2957,7 @@
         }
         banner(gb, "ok", okMsg);
       } catch (e) {
+        setMigrateEnqueueBusy(false);
         banner(gb, "err", e.message || String(e));
       }
     };

@@ -1108,6 +1108,303 @@ def _merge_proxmox(base: dict[str, Any], over: ProxmoxTestOverrides | None) -> d
     return m
 
 
+def _normalize_firmware_hint(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("uefi", "ovmf", "efi"):
+        return "uefi"
+    if k in ("seabios", "bios", "legacy"):
+        return "seabios"
+    return ""
+
+
+def _normalize_guest_profile_hint(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("windows", "win"):
+        return "windows"
+    if k in ("linux", "l26", "other"):
+        return "linux"
+    return ""
+
+
+def _guest_profile_from_ostype(ostype: str | None) -> str:
+    o = (ostype or "").strip().lower()
+    if not o:
+        return ""
+    if o.startswith("win") or o in ("wxp", "w2k", "w2k3", "w2k8", "wvista"):
+        return "windows"
+    if o.startswith("l") or o in ("solaris", "other"):
+        return "linux"
+    return ""
+
+
+def _import_metadata_volume_arg(storage_id: str, volume: str) -> str:
+    """
+    PVE ``import-metadata`` expects ``volume`` relative to the storage, not a full volid.
+
+    Content listings return ``<storage>:dc/path/file.vmx``; the metadata API wants
+    ``dc/path/file.vmx``. Passing the storage-prefixed volid fails with a 500
+    (file not found under the ESXi mount).
+    """
+    vol = (volume or "").strip()
+    sid = (storage_id or "").strip()
+    if not vol:
+        return ""
+    if sid and vol.startswith(sid + ":"):
+        return vol[len(sid) + 1 :].lstrip("/")
+    # Already an esxi:… URI or bare path — strip a leading ``esxi:`` if present.
+    low = vol.lower()
+    if low.startswith("esxi:"):
+        return vol[5:].lstrip("/")
+    if ":" in vol:
+        _left, _sep, right = vol.partition(":")
+        if right.strip():
+            return right.strip().lstrip("/")
+    return vol
+
+
+def _pve_import_metadata(api: ProxmoxAPI, node: str, storage_id: str, volume: str) -> dict[str, Any] | None:
+    """
+    GET /nodes/{node}/storage/{storage}/import-metadata?volume=…
+    Returns the PVE data object (create-args, disks, warnings, …) or None on failure.
+    """
+    nod = (node or "").strip()
+    sid = (storage_id or "").strip()
+    vol = _import_metadata_volume_arg(sid, volume)
+    if not nod or not sid or not vol:
+        return None
+    raw: Any = None
+    try:
+        raw = api.nodes(nod).storage(sid).get("import-metadata", volume=vol)
+    except Exception:
+        try:
+            raw = api.nodes(nod).storage(sid)("import-metadata").get(volume=vol)
+        except Exception:
+            return None
+    if isinstance(raw, dict):
+        # Some proxmoxer versions wrap under "data"
+        inner = raw.get("data") if isinstance(raw.get("data"), dict) and "create-args" not in raw else raw
+        return inner if isinstance(inner, dict) else raw
+    return None
+
+
+def _optional_positive_int(raw: Any) -> int | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _total_cores_from_create_args(create: dict[str, Any]) -> int | None:
+    """
+    PVE ESXi import-metadata exposes ``cores`` (per socket) and ``sockets``.
+    Job ``cores`` is total vCPUs = cores × sockets when both are present.
+    """
+    c = _optional_positive_int(create.get("cores"))
+    s = _optional_positive_int(create.get("sockets"))
+    if c is not None and s is not None:
+        return c * s
+    if c is not None:
+        return c
+    if s is not None:
+        return s
+    return None
+
+
+def _hints_from_import_metadata(meta: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """Map PVE import-metadata create-args into firmware / profile / RAM / CPU suggestions."""
+    px = cfg.get("proxmox") or {}
+    create = meta.get("create-args") or meta.get("create_args") or {}
+    if not isinstance(create, dict):
+        create = {}
+    bios_raw = str(create.get("bios") or "").strip().lower()
+    firmware = _normalize_firmware_hint(bios_raw) or (
+        "uefi" if bios_raw == "ovmf" else ("seabios" if bios_raw == "seabios" else "")
+    )
+    ostype = str(create.get("ostype") or "").strip()
+    profile = _guest_profile_from_ostype(ostype)
+    warnings: list[str] = []
+    raw_warn = meta.get("warnings") or meta.get("warn") or []
+    if isinstance(raw_warn, list):
+        for w in raw_warn:
+            if isinstance(w, str) and w.strip():
+                warnings.append(w.strip())
+            elif isinstance(w, dict):
+                msg = str(w.get("message") or w.get("key") or w).strip()
+                if msg:
+                    warnings.append(msg)
+    elif isinstance(raw_warn, str) and raw_warn.strip():
+        warnings.append(raw_warn.strip())
+
+    if not firmware:
+        firmware = _normalize_firmware_hint(str(px.get("default_firmware") or "")) or "uefi"
+    if not profile:
+        profile = _normalize_guest_profile_hint(str(px.get("default_guest_profile") or "")) or "windows"
+
+    memory_mb = _optional_positive_int(create.get("memory"))
+    cores = _total_cores_from_create_args(create)
+    enable_vtpm_suggested = firmware == "uefi" and profile == "windows"
+    return {
+        "firmware": firmware,
+        "guest_profile": profile,
+        "enable_vtpm_suggested": enable_vtpm_suggested,
+        "memory_mb": memory_mb,
+        "cores": cores,
+        "ostype": ostype or None,
+        "warnings": warnings,
+        "source": "import-metadata",
+    }
+
+
+def _default_guest_import_hints(cfg: dict[str, Any]) -> dict[str, Any]:
+    px = cfg.get("proxmox") or {}
+    firmware = _normalize_firmware_hint(str(px.get("default_firmware") or "")) or "uefi"
+    profile = _normalize_guest_profile_hint(str(px.get("default_guest_profile") or "")) or "windows"
+    memory_mb = _optional_positive_int(px.get("memory_mb"))
+    cores = _optional_positive_int(px.get("cores"))
+    return {
+        "firmware": firmware,
+        "guest_profile": profile,
+        "enable_vtpm_suggested": firmware == "uefi" and profile == "windows",
+        "memory_mb": memory_mb,
+        "cores": cores,
+        "ostype": None,
+        "warnings": [],
+        "source": "config-default",
+    }
+
+
+def discover_esxi_vmx_volid_from_pve(node: str, vm_name: str) -> str | None:
+    """Best ``.vmx`` volid on linked ESXi storage for ``import-metadata`` (None if not found)."""
+    name = (vm_name or "").strip()
+    nod = (node or "").strip()
+    if not name or not nod:
+        return None
+    try:
+        cfg = load_yaml()
+        px = cfg.get("proxmox") or {}
+        api = _proxmox_from_dict(px)
+        raw = api.nodes(nod).storage.get()
+    except Exception:
+        return None
+    if not isinstance(raw, list):
+        return None
+    esxi_ids = [
+        str(s.get("storage"))
+        for s in raw
+        if isinstance(s, dict)
+        and str(s.get("type", "")).lower() == "esxi"
+        and str(s.get("storage", "")).strip()
+    ]
+    nlow = name.lower()
+    scored: list[tuple[int, int, int, str]] = []
+    for sid in esxi_ids:
+        try:
+            items = api.nodes(nod).storage(sid).content.get()
+        except Exception:
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            volid = str(it.get("volid") or "").strip()
+            if not volid or not volid.lower().endswith(".vmx"):
+                continue
+            uri = _esxi_uri_from_volid(volid)
+            if not uri:
+                continue
+            label = _guest_label_from_esxi_path(uri)
+            if not label or label.strip().lower() != nlow:
+                continue
+            depth, rank, _, _ = _inventory_uri_rank(uri, nlow, ext="vmx")
+            shallow = 1 if esxi_import_uri_shallow_alias(uri, name) else 0
+            scored.append((depth, rank, shallow, volid))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    return scored[0][3]
+
+
+def resolve_guest_import_hints(
+    cfg: dict[str, Any],
+    node: str | None,
+    vm_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    """
+    Per-VM firmware/profile/vTPM suggestions from PVE ``import-metadata`` on each guest's ``.vmx``.
+    Falls back to config defaults when metadata is unavailable.
+    """
+    defaults = _default_guest_import_hints(cfg)
+    out: dict[str, dict[str, Any]] = {}
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in vm_names:
+        name = (raw or "").strip()
+        lk = name.lower()
+        if not name or lk in seen:
+            continue
+        seen.add(lk)
+        ordered.append(name)
+
+    nod = (node or "").strip() or str((cfg.get("proxmox") or {}).get("default_node") or "").strip()
+    if not nod or not ordered:
+        for name in ordered:
+            out[name] = {**defaults, "vm_name": name, "vmx_volid": None}
+        return out
+
+    px = cfg.get("proxmox") or {}
+    try:
+        api = _proxmox_from_dict(px)
+    except Exception:
+        for name in ordered:
+            out[name] = {**defaults, "vm_name": name, "vmx_volid": None}
+        return out
+
+    for name in ordered:
+        hint = {**defaults, "vm_name": name, "vmx_volid": None}
+        volid = discover_esxi_vmx_volid_from_pve(nod, name)
+        if volid:
+            hint["vmx_volid"] = volid
+            sid = volid.split(":", 1)[0].strip() if ":" in volid else ""
+            meta = _pve_import_metadata(api, nod, sid, volid) if sid else None
+            if meta:
+                parsed = _hints_from_import_metadata(meta, cfg)
+                # Keep config defaults when VMX omits memory/cores (PVE may omit cores==1).
+                for k in ("memory_mb", "cores"):
+                    if parsed.get(k) is None:
+                        parsed[k] = hint.get(k)
+                hint.update(parsed)
+                hint["vm_name"] = name
+                hint["vmx_volid"] = volid
+        out[name] = hint
+    return out
+
+
+class GuestImportHintsRequest(BaseModel):
+    vm_names: list[str] = Field(..., min_length=1)
+    proxmox_node: str | None = None
+
+
+@router.post("/api/ui/guest-import-hints", dependencies=[Depends(require_ui_session)])
+def guest_import_hints(body: GuestImportHintsRequest) -> dict[str, Any]:
+    """
+    Prefetch firmware / guest-profile / vTPM suggestions for the Migrate dialog matrix.
+    Uses PVE ``import-metadata`` on each guest's ``.vmx`` when available.
+    """
+    cfg = load_yaml()
+    px = cfg.get("proxmox") or {}
+    node = (body.proxmox_node or px.get("default_node") or "").strip() or None
+    hints = resolve_guest_import_hints(cfg, node, body.vm_names)
+    return {
+        "proxmox_node": node or "",
+        "guests": [hints[n] for n in hints],
+        "by_name": hints,
+    }
+
+
 @router.post("/api/ui/test/vmware", dependencies=[Depends(require_ui_session)])
 def test_vmware(body: VMwareTestOverrides | None = None) -> dict[str, Any]:
     cfg = load_yaml()

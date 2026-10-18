@@ -30,7 +30,7 @@ def authed_client(client: TestClient) -> TestClient:
     return client
 
 
-def test_post_jobs_simulated_enqueues_and_writes_hash(
+def test_post_jobs_with_explicit_vmdk_enqueues_and_writes_hash(
     authed_client: TestClient,
     fake_redis: fakeredis.FakeStrictRedis,
     monkeypatch: pytest.MonkeyPatch,
@@ -39,6 +39,20 @@ def test_post_jobs_simulated_enqueues_and_writes_hash(
     monkeypatch.setattr(main_module, "connect_proxmox", lambda c: MagicMock())
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_cluster", lambda prox: {999})
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_on_node", lambda prox, node: {999})
+    monkeypatch.setattr(main_module, "_assert_no_vmware_snapshots_esxi", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main_module.ui_module,
+        "resolve_guest_import_hints",
+        lambda cfg, node, names: {
+            n: {
+                "firmware": "uefi",
+                "guest_profile": "windows",
+                "enable_vtpm_suggested": True,
+                "source": "test",
+            }
+            for n in names
+        },
+    )
 
     resp = authed_client.post(
         "/jobs",
@@ -47,7 +61,7 @@ def test_post_jobs_simulated_enqueues_and_writes_hash(
             "proxmox_vmid": 3501,
             "proxmox_node": "pve",
             "proxmox_storage": "local-lvm",
-            "simulated_import": True,
+            "vmdk_path_on_node": "esxiStore:dc/ds/ApiGuest/ApiGuest.vmdk",
             "preimported_disk_mode": False,
             "take_snapshot": True,
             "winrm_user": "Administrator",
@@ -59,7 +73,9 @@ def test_post_jobs_simulated_enqueues_and_writes_hash(
     assert body["vm_name"] == "ApiGuest"
     assert body["state"] == "PENDING"
     assert body["proxmox_vmid"] == 3501
-    assert "simulated" in (body.get("vmdk_path_on_node") or "").lower() or body.get("simulated_import") is True
+    assert body.get("firmware") == "uefi"
+    assert body.get("guest_profile") == "windows"
+    assert body.get("enable_vtpm") is True
 
     cfg = main_module.load_config()
     q = cfg["redis"]["queue_key"]
@@ -68,6 +84,7 @@ def test_post_jobs_simulated_enqueues_and_writes_hash(
     assert queued == body["job_id"]
     key = main_module.job_key(cfg, body["job_id"])
     assert fake_redis.hget(key, "vm_name") == "ApiGuest"
+    assert fake_redis.hget(key, "firmware") == "uefi"
 
 
 def test_post_jobs_409_when_proxmox_vmid_already_in_use(
@@ -79,6 +96,12 @@ def test_post_jobs_409_when_proxmox_vmid_already_in_use(
     monkeypatch.setattr(main_module, "connect_proxmox", lambda c: MagicMock())
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_cluster", lambda prox: {3501, 3502})
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_on_node", lambda prox, node: {3501, 3502})
+    monkeypatch.setattr(main_module, "_assert_no_vmware_snapshots_esxi", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main_module.ui_module,
+        "resolve_guest_import_hints",
+        lambda cfg, node, names: {n: {} for n in names},
+    )
 
     resp = authed_client.post(
         "/jobs",
@@ -87,7 +110,7 @@ def test_post_jobs_409_when_proxmox_vmid_already_in_use(
             "proxmox_vmid": 3501,
             "proxmox_node": "pve",
             "proxmox_storage": "local-lvm",
-            "simulated_import": True,
+            "vmdk_path_on_node": "esxiStore:dc/ds/InUse/InUse.vmdk",
             "preimported_disk_mode": False,
             "take_snapshot": True,
         },
@@ -116,7 +139,7 @@ def test_migrate_selected_409_when_guest_has_active_job(
             "updated_at": "2026-01-02T00:00:00",
             "proxmox_vmid": "3501",
             "proxmox_node": "pve",
-            "vmdk_path_on_node": "simulated:clone",
+            "vmdk_path_on_node": "esxiStore:dc/ds/BlockedGuest/BlockedGuest.vmdk",
             "winrm_user": "Administrator",
             "winrm_password": "",
             "guest_ip": "",
@@ -128,11 +151,18 @@ def test_migrate_selected_409_when_guest_has_active_job(
     monkeypatch.setattr(
         main_module.ui_module,
         "enumerate_guests_from_pve_esxi",
-        lambda c, n: [{"name": "BlockedGuest", "esxi_import_uri": "", "esxi_storage_ids": []}],
+        lambda c, n: [
+            {
+                "name": "BlockedGuest",
+                "esxi_import_uri": "esxiStore:dc/ds/BlockedGuest/BlockedGuest.vmdk",
+                "esxi_storage_ids": ["esxiStore"],
+            }
+        ],
     )
     monkeypatch.setattr(main_module, "connect_proxmox", lambda c: MagicMock())
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_cluster", lambda prox: set())
     monkeypatch.setattr(main_module, "qemu_vmids_in_use_on_node", lambda prox, node: set())
+    monkeypatch.setattr(main_module, "_assert_no_vmware_snapshots_esxi", lambda *a, **k: None)
 
     resp = authed_client.post(
         "/jobs/migrate-selected",
@@ -142,11 +172,117 @@ def test_migrate_selected_409_when_guest_has_active_job(
             "proxmox_storage": "local-lvm",
             "memory_mb": 8192,
             "cores": 4,
-            "simulated_import": True,
+            "firmware_mode": "importer",
         },
     )
     assert resp.status_code == 409
     assert "already in progress" in resp.json()["detail"].lower()
+
+
+def test_migrate_selected_override_writes_per_vm_firmware(
+    authed_client: TestClient,
+    fake_redis: fakeredis.FakeStrictRedis,
+    monkeypatch: pytest.MonkeyPatch,
+    main_module: Any,
+) -> None:
+    monkeypatch.setattr(
+        main_module.ui_module,
+        "enumerate_guests_from_pve_esxi",
+        lambda c, n: [
+            {
+                "name": "WinVDI",
+                "esxi_import_uri": "store:a/WinVDI/WinVDI.vmdk",
+                "esxi_storage_ids": ["store"],
+            },
+            {
+                "name": "LinuxDB",
+                "esxi_import_uri": "store:a/LinuxDB/LinuxDB.vmdk",
+                "esxi_storage_ids": ["store"],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        main_module.ui_module,
+        "resolve_guest_import_hints",
+        lambda cfg, node, names: {
+            "WinVDI": {
+                "firmware": "uefi",
+                "guest_profile": "windows",
+                "enable_vtpm_suggested": True,
+                "source": "import-metadata",
+            },
+            "LinuxDB": {
+                "firmware": "seabios",
+                "guest_profile": "linux",
+                "enable_vtpm_suggested": False,
+                "source": "import-metadata",
+            },
+        },
+    )
+    monkeypatch.setattr(main_module, "connect_proxmox", lambda c: MagicMock())
+    monkeypatch.setattr(main_module, "qemu_vmids_in_use_cluster", lambda prox: set())
+    monkeypatch.setattr(main_module, "_assert_no_vmware_snapshots_esxi", lambda *a, **k: None)
+
+    resp = authed_client.post(
+        "/jobs/migrate-selected",
+        json={
+            "vm_names": ["WinVDI", "LinuxDB"],
+            "proxmox_vmid_start": 3510,
+            "proxmox_storage": "local-lvm",
+            "memory_mb": 8192,
+            "cores": 4,
+            "firmware_mode": "override",
+            "vm_overrides": {
+                "WinVDI": {
+                    "guest_profile": "windows",
+                    "firmware": "uefi",
+                    "enable_vtpm": True,
+                    "memory_mb": 12288,
+                    "cores": 6,
+                    "vlan": 100,
+                },
+                "LinuxDB": {
+                    "guest_profile": "linux",
+                    "firmware": "uefi",
+                    "enable_vtpm": False,
+                    "memory_mb": 4096,
+                    "cores": 2,
+                    "vlan": None,
+                },
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["enqueued"] == 2
+    cfg = main_module.load_config()
+    jobs = {}
+    for jid in body["job_ids"]:
+        key = main_module.job_key(cfg, jid)
+        jobs[fake_redis.hget(key, "vm_name")] = {
+            "firmware": fake_redis.hget(key, "firmware"),
+            "guest_profile": fake_redis.hget(key, "guest_profile"),
+            "enable_vtpm": fake_redis.hget(key, "enable_vtpm"),
+            "memory_mb": fake_redis.hget(key, "memory_mb"),
+            "cores": fake_redis.hget(key, "cores"),
+            "vlan": fake_redis.hget(key, "vlan"),
+        }
+    assert jobs["WinVDI"] == {
+        "firmware": "uefi",
+        "guest_profile": "windows",
+        "enable_vtpm": "1",
+        "memory_mb": "12288",
+        "cores": "6",
+        "vlan": "100",
+    }
+    assert jobs["LinuxDB"] == {
+        "firmware": "uefi",
+        "guest_profile": "linux",
+        "enable_vtpm": "0",
+        "memory_mb": "4096",
+        "cores": "2",
+        "vlan": None,
+    }
 
 
 def test_migration_defaults_contains_expected_keys(
@@ -162,7 +298,9 @@ def test_migration_defaults_contains_expected_keys(
     assert "storage" in data
     assert "default_node" in data
     assert "net_mtu" in data
-    assert "simulated_import_default" in data
+    assert data.get("default_firmware") == "uefi"
+    assert data.get("default_guest_profile") == "windows"
+    assert "simulated_import_default" not in data
 
 
 def test_enqueue_efi_redo_pending_enqueues_only_tagged_vms(

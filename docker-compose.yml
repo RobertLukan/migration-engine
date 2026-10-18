@@ -10,7 +10,7 @@
 #   # edit config.docker.yaml — keep redis.url host as "redis"
 #   docker compose up -d
 #
-# Uncomment the api/worker volumes section to mount ./config.docker.yaml
+# api/worker always mount ./config.docker.yaml (create from config.docker.example.yaml).
 #
 # Build on Apple Silicon but deploy on Intel/AMD64 Linux: keep `platform: linux/amd64` below.
 # For native ARM64 builds on Mac (local test only), comment out all `platform` lines.
@@ -42,10 +42,9 @@ services:
       - "8000:8000"
     environment:
       MIGRATION_ENGINE_CONFIG: /app/config.docker.yaml
-    command: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port 8000
+    # Explicit so a botched `docker commit` cannot leave ENTRYPOINT=sleep.
+    entrypoint: ["uvicorn"]
+    command: ["main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test:
         [
@@ -58,8 +57,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-    # volumes:
-    #   - ./config.docker.yaml:/app/config.docker.yaml:ro
+    volumes:
+      - ./config.docker.yaml:/app/config.docker.yaml
 
   # v2.0+: run multiple workers for parallel jobs; ESXi import concurrency is capped per storage id in Redis
   # (see worker.max_concurrent_imports_per_esxi_storage). Example: docker compose up -d --scale worker=4
@@ -73,11 +72,13 @@ services:
     networks: [migration]
     environment:
       MIGRATION_ENGINE_CONFIG: /app/config.docker.yaml
-    command: ["python", "worker.py"]
+    # Explicit so a botched `docker commit` cannot leave ENTRYPOINT=sleep.
+    entrypoint: ["python"]
+    command: ["worker.py"]
     healthcheck:
       disable: true
-    # volumes:
-    #   - ./config.docker.yaml:/app/config.docker.yaml:ro
+    volumes:
+      - ./config.docker.yaml:/app/config.docker.yaml:ro
 
 networks:
   migration:

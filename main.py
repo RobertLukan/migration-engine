@@ -401,10 +401,6 @@ class CreateJobRequest(BaseModel):
     vlan: int | str | None = Field(default=None, description="Optional VLAN tag (1-4094) for guest net0")
     winrm_user: str = Field(default="Administrator")
     winrm_password: str = Field(default="")
-    simulated_import: bool | None = Field(
-        default=None,
-        description="If true, clone proxmox.simulated_clone_source_vmid instead of VMware import; None uses config default",
-    )
     preimported_disk_mode: bool = Field(
         default=False,
         description=(
@@ -412,13 +408,17 @@ class CreateJobRequest(BaseModel):
             "and OS disk was attached/imported manually (e.g. qm importdisk)."
         ),
     )
-    simulated_clone_source_vmid: int | None = Field(
+    firmware: Literal["uefi", "seabios"] | None = Field(
         default=None,
-        ge=100,
-        description=(
-            "Only for simulated_import=true: source Proxmox template VMID to clone. "
-            "If unset, proxmox.simulated_clone_source_vmid from config is used."
-        ),
+        description="Guest firmware; None uses import-metadata / config default (uefi).",
+    )
+    guest_profile: Literal["windows", "linux"] | None = Field(
+        default=None,
+        description="Guest OS profile for ostype/vTPM defaults; None uses import-metadata / config (windows).",
+    )
+    enable_vtpm: bool | None = Field(
+        default=None,
+        description="Attach tpmstate0; None = auto (UEFI+windows only).",
     )
     qemu_cpu_preset: Literal["host_no_nested", "host_nested_vbs"] | None = Field(
         default=None,
@@ -433,27 +433,53 @@ class CreateJobRequest(BaseModel):
     )
 
 
+class VmJobOverride(BaseModel):
+    """Per-VM firmware / resources for migrate-selected (keyed by VM name in vm_overrides)."""
+
+    guest_profile: Literal["windows", "linux"] | None = None
+    firmware: Literal["uefi", "seabios"] | None = None
+    enable_vtpm: bool | None = None
+    memory_mb: int | None = Field(default=None, ge=512, le=1048576)
+    cores: int | None = Field(default=None, ge=1, le=256)
+    vlan: int | str | None = Field(
+        default=None,
+        description="Optional VLAN tag (1-4094). Empty / null = untagged for this VM.",
+    )
+
+
+# Backward-compatible alias
+VmFirmwareOverride = VmJobOverride
+
+
 class MigrateSelectedRequest(BaseModel):
-    """Enqueue one migration job per VM name (must exist in vCenter inventory)."""
+    """Enqueue one migration job per VM name (must exist on PVE ESXi listing / vCenter)."""
 
     vm_names: list[str] = Field(..., min_length=1)
     proxmox_vmid_start: int = Field(..., ge=100, le=999999999)
     proxmox_storage: str = Field(..., min_length=1, description="PVE storage id, e.g. local-lvm")
-    memory_mb: int = Field(..., ge=512, le=1048576)
-    cores: int = Field(..., ge=1, le=256)
-    vlan: int | str | None = Field(default=None, description="Optional VLAN tag (1-4094) for guest net0")
+    memory_mb: int = Field(
+        ...,
+        ge=512,
+        le=1048576,
+        description="Batch default RAM (MiB); per-VM vm_overrides.memory_mb / import-metadata win when set.",
+    )
+    cores: int = Field(
+        ...,
+        ge=1,
+        le=256,
+        description="Batch default vCPUs; per-VM vm_overrides.cores / import-metadata win when set.",
+    )
+    vlan: int | str | None = Field(
+        default=None,
+        description="Batch default VLAN tag (1-4094); per-VM vm_overrides.vlan wins when provided.",
+    )
     proxmox_node: str | None = None
     winrm_user: str = "Administrator"
     winrm_password: str = ""
-    simulated_import: bool | None = Field(
-        default=None,
-        description="If true, clone template VM on Proxmox instead of VMware disk import; None uses config default",
-    )
     import_mode: Literal["standard", "nfs"] = Field(
         default="standard",
         description=(
-            "Disk source mode for non-simulated jobs: "
-            "'standard' uses proxmox.vmdk_path_template/auto-esxi behavior, "
+            "Disk source mode: 'standard' uses proxmox.vmdk_path_template/auto-esxi behavior, "
             "'nfs' uses nfs_vmdk_path_template from request."
         ),
     )
@@ -461,13 +487,17 @@ class MigrateSelectedRequest(BaseModel):
         default=None,
         description="Required when import_mode='nfs'; include {vm_name} placeholder.",
     )
-    simulated_clone_source_vmid: int | None = Field(
-        default=None,
-        ge=100,
+    firmware_mode: Literal["importer", "override"] = Field(
+        default="importer",
         description=(
-            "Only for simulated_import=true: source Proxmox template VMID to clone. "
-            "If unset, proxmox.simulated_clone_source_vmid from config is used."
+            "importer: resolve firmware/profile/vTPM per VM from PVE import-metadata. "
+            "override: use vm_overrides firmware cells with importer/config fallbacks for missing cells. "
+            "Resource fields in vm_overrides (memory/cores/vlan) apply in both modes."
         ),
+    )
+    vm_overrides: dict[str, VmJobOverride] | None = Field(
+        default=None,
+        description="Per-VM resource and/or firmware overrides (keyed by VM name).",
     )
     qemu_cpu_preset: Literal["host_no_nested", "host_nested_vbs"] | None = Field(
         default=None,
@@ -519,9 +549,10 @@ class JobRecord(BaseModel):
     last_failed_stage: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
-    simulated_import: bool | None = None
     preimported_disk_mode: bool | None = None
-    simulated_clone_source_vmid: int | None = None
+    firmware: str | None = None
+    guest_profile: str | None = None
+    enable_vtpm: bool | None = None
     qemu_cpu_preset: str | None = None
     take_snapshot: bool | None = None
     import_mode: str | None = None
@@ -557,7 +588,7 @@ if not _session_secret:
         "config.yaml must define ui.session_secret (random string) and ui.password (dashboard password)"
     )
 
-app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.0.0")
+app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.1.0")
 app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret,
@@ -820,12 +851,153 @@ def _migration_default_net_mtu(px: dict[str, Any]) -> int:
     return nm if nm > 0 else 1500
 
 
+def _norm_enqueue_firmware(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("uefi", "ovmf", "efi"):
+        return "uefi"
+    if k in ("seabios", "bios", "legacy"):
+        return "seabios"
+    return ""
+
+
+def _norm_enqueue_profile(raw: str | None) -> str:
+    k = (raw or "").strip().lower()
+    if k in ("windows", "win"):
+        return "windows"
+    if k in ("linux", "l26", "other"):
+        return "linux"
+    return ""
+
+
+def _auto_enable_vtpm(firmware: str, profile: str) -> bool:
+    return firmware == "uefi" and profile == "windows"
+
+
+def _resolve_vm_firmware_fields(
+    *,
+    cfg: dict[str, Any],
+    vm_name: str,
+    importer_hint: dict[str, Any] | None,
+    override: VmFirmwareOverride | None,
+    firmware_mode: str,
+    body_firmware: str | None = None,
+    body_profile: str | None = None,
+    body_enable_vtpm: bool | None = None,
+) -> tuple[str, str, bool]:
+    """
+    Resolve (firmware, guest_profile, enable_vtpm) for one enqueue.
+    Priority: explicit override/body → import-metadata hint → config defaults.
+    """
+    px = cfg.get("proxmox") or {}
+    hint = importer_hint or {}
+    use_override = (firmware_mode or "importer").strip().lower() == "override"
+
+    firmware = ""
+    profile = ""
+    vtpm_set: bool | None = None
+
+    if use_override and override is not None:
+        firmware = _norm_enqueue_firmware(override.firmware)
+        profile = _norm_enqueue_profile(override.guest_profile)
+        if override.enable_vtpm is not None:
+            vtpm_set = bool(override.enable_vtpm)
+
+    if not firmware:
+        firmware = _norm_enqueue_firmware(body_firmware)
+    if not profile:
+        profile = _norm_enqueue_profile(body_profile)
+    if vtpm_set is None and body_enable_vtpm is not None:
+        vtpm_set = bool(body_enable_vtpm)
+
+    if not firmware:
+        firmware = _norm_enqueue_firmware(str(hint.get("firmware") or ""))
+    if not profile:
+        profile = _norm_enqueue_profile(str(hint.get("guest_profile") or ""))
+
+    if not firmware:
+        firmware = _norm_enqueue_firmware(str(px.get("default_firmware") or "")) or "uefi"
+    if not profile:
+        profile = _norm_enqueue_profile(str(px.get("default_guest_profile") or "")) or "windows"
+
+    if vtpm_set is None:
+        cfg_tpm = px.get("default_enable_vtpm")
+        if cfg_tpm is True:
+            vtpm_set = True
+        elif cfg_tpm is False:
+            vtpm_set = False
+        elif "enable_vtpm_suggested" in hint and hint.get("enable_vtpm_suggested") is not None:
+            vtpm_set = bool(hint.get("enable_vtpm_suggested"))
+        else:
+            vtpm_set = _auto_enable_vtpm(firmware, profile)
+
+    return firmware, profile, bool(vtpm_set)
+
+
+def _firmware_fields_to_mapping(firmware: str, profile: str, enable_vtpm: bool) -> dict[str, str]:
+    return {
+        "firmware": firmware,
+        "guest_profile": profile,
+        "enable_vtpm": "1" if enable_vtpm else "0",
+    }
+
+
+def _resolve_vm_resources(
+    *,
+    body_memory_mb: int,
+    body_cores: int,
+    body_vlan: int | str | None,
+    importer_hint: dict[str, Any] | None,
+    override: VmJobOverride | None,
+) -> tuple[int, int, str | None]:
+    """
+    Resolve (memory_mb, cores, vlan_str_or_none) for one enqueue.
+    Priority: explicit per-VM override → import-metadata hint → batch body defaults.
+    VLAN is never taken from import-metadata (not in VMX create-args for our use).
+    """
+    hint = importer_hint or {}
+    memory_mb = int(body_memory_mb)
+    cores = int(body_cores)
+    if override is not None and override.memory_mb is not None:
+        memory_mb = int(override.memory_mb)
+    else:
+        try:
+            hm = int(hint["memory_mb"]) if hint.get("memory_mb") is not None else None
+        except (TypeError, ValueError):
+            hm = None
+        if hm is not None and hm >= 512:
+            memory_mb = hm
+
+    if override is not None and override.cores is not None:
+        cores = int(override.cores)
+    else:
+        try:
+            hc = int(hint["cores"]) if hint.get("cores") is not None else None
+        except (TypeError, ValueError):
+            hc = None
+        if hc is not None and hc >= 1:
+            cores = hc
+
+    vlan_out: str | None = None
+    if override is not None and "vlan" in override.model_fields_set:
+        raw = override.vlan
+        if raw is not None and str(raw).strip() != "":
+            vlan_out = str(raw).strip()
+    elif body_vlan is not None and str(body_vlan).strip() != "":
+        vlan_out = str(body_vlan).strip()
+
+    memory_mb = max(512, min(1048576, memory_mb))
+    cores = max(1, min(256, cores))
+    return memory_mb, cores, vlan_out
+
+
 @api.get("/migration-defaults")
 def migration_defaults(proxmox_node: str | None = None) -> dict[str, Any]:
     """Defaults for the migrate dialog (from config.yaml proxmox section)."""
     cfg = load_config()
     p = cfg.get("proxmox") or {}
     tmpl = (p.get("vmdk_path_template") or "").strip()
+    def_fw = _norm_enqueue_firmware(str(p.get("default_firmware") or "")) or "uefi"
+    def_prof = _norm_enqueue_profile(str(p.get("default_guest_profile") or "")) or "windows"
     out: dict[str, Any] = {
         "storage": p.get("storage", "local-lvm"),
         "memory_mb": int(p.get("memory_mb", 16384)),
@@ -838,9 +1010,9 @@ def migration_defaults(proxmox_node: str | None = None) -> dict[str, Any]:
         "vmdk_template_auto_esxi": tmpl.lower() in _AUTO_ESXI_TEMPLATES,
         "vmdk_auto_esxi_prefers_pve": True,
         "esxi_import_parent_hint": (p.get("esxi_import_parent_hint") or "").strip(),
-        "simulated_import_default": bool(p.get("simulated_import", False)),
-        "simulated_clone_source_vmid": int(p.get("simulated_clone_source_vmid", 147) or 147),
-        "simulated_clone_source_node": (p.get("simulated_clone_source_node") or "").strip(),
+        "default_firmware": def_fw,
+        "default_guest_profile": def_prof,
+        "default_enable_vtpm": p.get("default_enable_vtpm"),
     }
     safety = p.get("safety")
     if isinstance(safety, dict):
@@ -888,20 +1060,13 @@ def create_job(body: CreateJobRequest) -> JobRecord:
             detail="proxmox.default_node or proxmox_node is required to verify VM ID availability",
         )
     px = cfg.get("proxmox") or {}
-    use_simulated = body.simulated_import
-    if use_simulated is None:
-        use_simulated = bool(px.get("simulated_import", False))
     use_preimported = bool(body.preimported_disk_mode)
-    if use_preimported and use_simulated:
-        raise HTTPException(status_code=400, detail="preimported_disk_mode and simulated_import cannot both be true")
-    if not use_simulated and not use_preimported:
+    if not use_preimported:
         _assert_no_vmware_snapshots_esxi(node, [body.vm_name])
     template = (px.get("vmdk_path_template") or "").strip()
     vmdk = (body.vmdk_path_on_node or "").strip()
     if use_preimported:
         vmdk = "preimported:manual"
-    elif use_simulated:
-        vmdk = vmdk or "simulated:clone"
     elif not vmdk:
         if not template:
             raise HTTPException(status_code=400, detail="vmdk_path_on_node or vmdk_path_template required")
@@ -986,11 +1151,20 @@ def create_job(body: CreateJobRequest) -> JobRecord:
         mapping["cores"] = str(body.cores)
     if body.vlan is not None and str(body.vlan).strip() != "":
         mapping["vlan"] = str(body.vlan).strip()
-    mapping["simulated_import"] = "1" if use_simulated else "0"
     mapping["preimported_disk_mode"] = "1" if use_preimported else "0"
     mapping["take_snapshot"] = "1" if body.take_snapshot else "0"
-    if use_simulated and body.simulated_clone_source_vmid is not None:
-        mapping["simulated_clone_source_vmid"] = str(int(body.simulated_clone_source_vmid))
+    hints = ui_module.resolve_guest_import_hints(cfg, str(node).strip(), [body.vm_name])
+    fw, prof, vtpm = _resolve_vm_firmware_fields(
+        cfg=cfg,
+        vm_name=body.vm_name,
+        importer_hint=hints.get(body.vm_name),
+        override=None,
+        firmware_mode="override" if (body.firmware or body.guest_profile or body.enable_vtpm is not None) else "importer",
+        body_firmware=body.firmware,
+        body_profile=body.guest_profile,
+        body_enable_vtpm=body.enable_vtpm,
+    )
+    mapping.update(_firmware_fields_to_mapping(fw, prof, vtpm))
     if body.qemu_cpu_preset is not None:
         mapping["qemu_cpu_preset"] = body.qemu_cpu_preset
     key = job_key(cfg, job_id)
@@ -1004,29 +1178,25 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     cfg = load_config()
     r = redis_client()
     px = cfg.get("proxmox") or {}
-    use_simulated = body.simulated_import
-    if use_simulated is None:
-        use_simulated = bool(px.get("simulated_import", False))
     import_mode = body.import_mode
     template = (px.get("vmdk_path_template") or "").strip()
     nfs_template = (body.nfs_vmdk_path_template or "").strip()
-    if not use_simulated:
-        if import_mode == "nfs":
-            if not nfs_template:
-                raise HTTPException(
-                    status_code=400,
-                    detail="import_mode='nfs' requires nfs_vmdk_path_template",
-                )
-            if "{vm_name}" not in nfs_template:
-                raise HTTPException(
-                    status_code=400,
-                    detail="nfs_vmdk_path_template must include '{vm_name}' placeholder",
-                )
-        elif not template:
+    if import_mode == "nfs":
+        if not nfs_template:
             raise HTTPException(
                 status_code=400,
-                detail="Set proxmox.vmdk_path_template in config.yaml (auto-esxi, or /imports/{vm_name}.vmdk, or esxi:DC/.../{vm_name}/...), or enable simulated import",
+                detail="import_mode='nfs' requires nfs_vmdk_path_template",
             )
+        if "{vm_name}" not in nfs_template:
+            raise HTTPException(
+                status_code=400,
+                detail="nfs_vmdk_path_template must include '{vm_name}' placeholder",
+            )
+    elif not template:
+        raise HTTPException(
+            status_code=400,
+            detail="Set proxmox.vmdk_path_template in config.yaml (auto-esxi, or /imports/{vm_name}.vmdk, or esxi:DC/.../{vm_name}/...)",
+        )
     node = body.proxmox_node or px.get("default_node")
     if not node:
         raise HTTPException(status_code=400, detail="proxmox.default_node or proxmox_node is required")
@@ -1047,7 +1217,7 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
     job_ids: list[str] = []
     storage = body.proxmox_storage.strip()
     node_str = str(node).strip()
-    if not use_simulated and import_mode == "standard":
+    if import_mode == "standard":
         _assert_no_vmware_snapshots_esxi(node_str, ordered)
     proxmox = connect_proxmox(cfg)
     try:
@@ -1090,7 +1260,7 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
         pve_uri_by_name[nm.lower()] = u
 
     pve_only_paths: dict[str, str] = {}
-    if not use_simulated and auto_esxi:
+    if auto_esxi:
         for n in ordered:
             hit = pve_uri_by_name.get(n.lower()) or ui_module.discover_esxi_import_from_pve(
                 node_str, n
@@ -1098,9 +1268,36 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
             if hit:
                 pve_only_paths[n] = hit
 
+    firmware_mode = (body.firmware_mode or "importer").strip().lower()
+    if firmware_mode not in ("importer", "override"):
+        raise HTTPException(status_code=400, detail="firmware_mode must be 'importer' or 'override'")
+    overrides_in = body.vm_overrides or {}
+    # Case-insensitive lookup for override keys (resources always; firmware when override mode)
+    overrides_by_lower: dict[str, VmJobOverride] = {
+        str(k).strip().lower(): v for k, v in overrides_in.items() if str(k).strip()
+    }
+    importer_hints = ui_module.resolve_guest_import_hints(cfg, node_str, ordered)
+
     def enqueue_one(name: str, vmdk: str, assigned_vmid: int) -> None:
         job_id = str(uuid.uuid4())
         now = utc_now_iso()
+        ov = overrides_by_lower.get(name.lower())
+        fw_ov = ov if firmware_mode == "override" else None
+        hint = importer_hints.get(name)
+        fw, prof, vtpm = _resolve_vm_firmware_fields(
+            cfg=cfg,
+            vm_name=name,
+            importer_hint=hint,
+            override=fw_ov,
+            firmware_mode=firmware_mode,
+        )
+        mem_mb, n_cores, vlan_s = _resolve_vm_resources(
+            body_memory_mb=body.memory_mb,
+            body_cores=body.cores,
+            body_vlan=body.vlan,
+            importer_hint=hint,
+            override=ov,
+        )
         mapping = {
             "job_id": job_id,
             "state": MigrationState.PENDING.value,
@@ -1109,8 +1306,8 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
             "proxmox_node": node,
             "vmdk_path_on_node": vmdk,
             "proxmox_storage": storage,
-            "memory_mb": str(body.memory_mb),
-            "cores": str(body.cores),
+            "memory_mb": str(mem_mb),
+            "cores": str(n_cores),
             "winrm_user": body.winrm_user,
             "winrm_password": body.winrm_password,
             "guest_ip": "",
@@ -1118,16 +1315,14 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
             "last_failed_stage": "",
             "created_at": now,
             "updated_at": now,
-            "simulated_import": "1" if use_simulated else "0",
             "import_mode": import_mode,
             "take_snapshot": "1" if body.take_snapshot else "0",
+            **_firmware_fields_to_mapping(fw, prof, vtpm),
         }
         if import_mode == "nfs" and nfs_template:
             mapping["nfs_vmdk_path_template"] = nfs_template
-        if body.vlan is not None and str(body.vlan).strip() != "":
-            mapping["vlan"] = str(body.vlan).strip()
-        if use_simulated and body.simulated_clone_source_vmid is not None:
-            mapping["simulated_clone_source_vmid"] = str(int(body.simulated_clone_source_vmid))
+        if vlan_s is not None:
+            mapping["vlan"] = vlan_s
         if body.qemu_cpu_preset is not None:
             mapping["qemu_cpu_preset"] = body.qemu_cpu_preset
         key = job_key(cfg, job_id)
@@ -1152,34 +1347,6 @@ def migrate_selected(body: MigrateSelectedRequest) -> dict[str, Any]:
                     "Names must match guests listed from linked ESXi storage in PVE."
                 ),
             )
-
-    if use_simulated:
-        if ui_module.vmware_credentials_configured(cfg):
-            try:
-                with vcenter_connection(cfg) as si:
-                    by_name = {vm.name: vm for vm in iter_virtual_machines(si)}
-                    if all(n in by_name for n in ordered):
-                        for name, vid in zip(ordered, allocated_ids, strict=True):
-                            enqueue_one(name, "simulated:clone", vid)
-                        return {
-                            "enqueued": len(job_ids),
-                            "job_ids": job_ids,
-                            "next_proxmox_vmid": next_proxmox_vmid,
-                            **_ms_extra,
-                        }
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-        _validate_names_against_pve_esxi()
-        for name, vid in zip(ordered, allocated_ids, strict=True):
-            enqueue_one(name, "simulated:clone", vid)
-        return {
-            "enqueued": len(job_ids),
-            "job_ids": job_ids,
-            "next_proxmox_vmid": next_proxmox_vmid,
-            **_ms_extra,
-        }
 
     if import_mode == "nfs":
         for name, vid in zip(ordered, allocated_ids, strict=True):
@@ -1338,10 +1505,12 @@ def enqueue_efi_redo_pending(body: EfiRedoEnqueueRequest) -> dict[str, Any]:
             "last_failed_stage": "",
             "created_at": now,
             "updated_at": now,
-            "simulated_import": "0",
             "preimported_disk_mode": "0",
             "take_snapshot": "0",
             "run_guest_script": "1" if body.run_guest_script else "0",
+            "firmware": "uefi",
+            "guest_profile": "windows",
+            "enable_vtpm": "0",
         }
         if body.guest_script_override is not None:
             mapping["efi_redo_guest_script_override"] = body.guest_script_override
@@ -1435,13 +1604,21 @@ def enqueue_from_vcenter(body: VCenterEnqueueRequest) -> dict[str, Any]:
                 "last_failed_stage": "",
                 "created_at": now,
                 "updated_at": now,
-                "simulated_import": "0",
             }
             if not mapping["vmdk_path_on_node"]:
                 raise HTTPException(
                     status_code=400,
                     detail="Set proxmox.vmdk_path_template in config.yaml (e.g. /imports/{vm_name}.vmdk or esxi:DC/.../{vm_name}/{vm_name}.vmdk)",
                 )
+            vc_hints = ui_module.resolve_guest_import_hints(cfg, node_str, [vm.name])
+            fw, prof, vtpm = _resolve_vm_firmware_fields(
+                cfg=cfg,
+                vm_name=vm.name,
+                importer_hint=vc_hints.get(vm.name),
+                override=None,
+                firmware_mode="importer",
+            )
+            mapping.update(_firmware_fields_to_mapping(fw, prof, vtpm))
             key = job_key(cfg, job_id)
             r.hset(key, mapping=mapping)
             r.rpush(cfg["redis"]["queue_key"], job_id)
@@ -1553,7 +1730,6 @@ def _job_parallelism_api_fields(
             "import_activity_status": "EFI redo queued/running",
         }
     vmdk = (data.get("vmdk_path_on_node") or "").strip()
-    sim = rec.simulated_import is True
     pre = rec.preimported_disk_mode is True
     wcfg = cfg.get("worker") or {}
     try:
@@ -1564,13 +1740,11 @@ def _job_parallelism_api_fields(
     vmware_h = str((cfg.get("vmware") or {}).get("host") or "").strip() or None
 
     bucket: str | None = None
-    if not sim and not pre:
+    if not pre:
         bucket = resolve_esxi_import_permit_bucket(cfg, vmdk)
     permit_state = (data.get("import_permit_state") or "").strip().upper() or None
 
-    if sim:
-        summary = "Simulated clone"
-    elif pre:
+    if pre:
         summary = "Preimported disk"
     elif bucket == "esxi_legacy_uri":
         summary = f"VMware URI pool · ≤{mc} concurrent"
@@ -1603,12 +1777,14 @@ def _job_parallelism_api_fields(
     if vmdk:
         vd = vmdk if len(vmdk) <= 220 else vmdk[:217] + "…"
         parts.append(f"Import path: {vd}")
+    fw = (data.get("firmware") or "").strip()
+    gp = (data.get("guest_profile") or "").strip()
+    if fw or gp:
+        parts.append(f"firmware={fw or '—'} profile={gp or '—'}")
     im = (data.get("import_mode") or "").strip()
     if im:
         parts.append(f"import_mode {im}")
-    if sim:
-        parts.append("Simulated: Proxmox clone only; no VMware import-from permit.")
-    elif pre:
+    if pre:
         parts.append("Preimported: attach existing disk; no VMware import-from permit.")
     elif permit_state == "WAITING" and bucket:
         parts.append(f"Current queue state: waiting for ESXi import permit on bucket {bucket}.")
@@ -1672,9 +1848,10 @@ def _hash_to_record(data: dict[str, str]) -> JobRecord:
         last_failed_stage=data.get("last_failed_stage") or None,
         created_at=data.get("created_at") or None,
         updated_at=data.get("updated_at") or None,
-        simulated_import=_parse_job_bool_field(data.get("simulated_import")),
         preimported_disk_mode=_parse_job_bool_field(data.get("preimported_disk_mode")),
-        simulated_clone_source_vmid=_optional_int(data, "simulated_clone_source_vmid"),
+        firmware=(data.get("firmware") or "").strip() or None,
+        guest_profile=(data.get("guest_profile") or "").strip() or None,
+        enable_vtpm=_parse_job_bool_field(data.get("enable_vtpm")),
         qemu_cpu_preset=(data.get("qemu_cpu_preset") or "").strip() or None,
         take_snapshot=_parse_job_bool_field(data.get("take_snapshot")),
         import_mode=(data.get("import_mode") or "").strip() or None,
