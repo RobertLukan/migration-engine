@@ -4,9 +4,7 @@ VMware → Proxmox migration orchestrator (**v2.2.0**): FastAPI dashboard and AP
 
 ## Intended use
 
-Primary use: **Windows 11 VDI** (UEFI + vTPM by default). Recent **Windows Server** guests are supported the same way.
-
-**Linux** guests can be migrated: choose SeaBIOS or UEFI to match the source, and **vTPM is not attached automatically** (only for UEFI + Windows unless you opt in). Forcing UEFI on a legacy-BIOS guest will not boot — prefer **importer-resolved** firmware from Proxmox VMX `import-metadata`, or override per VM in the Migrate dialog.
+Supports **Windows 11**, **Windows Server**, and **Linux** guests equally. Match firmware to the source (UEFI or SeaBIOS); **vTPM** is attached by default only for UEFI + Windows (opt in for other cases). Forcing UEFI on a legacy-BIOS guest will not boot — prefer **importer-resolved** firmware from Proxmox VMX `import-metadata`, or override per VM in the Migrate dialog.
 
 ## Features (v2.2)
 
