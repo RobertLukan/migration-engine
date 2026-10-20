@@ -162,27 +162,39 @@ def connect_proxmox(cfg: dict[str, Any]) -> ProxmoxAPI:
                 "Proxmox: api_token_id must look like 'user@realm!token_name' "
                 "(example: root@pam!migration)"
             )
-        return ProxmoxAPI(
-            host=p["host"],
-            user=user,
-            token_name=token_name,
-            token_value=token_secret,
-            port=int(p.get("port", 8006)),
-            verify_ssl=bool(p.get("verify_ssl", True)),
-            timeout=api_timeout,
-        )
+        try:
+            return ProxmoxAPI(
+                host=p["host"],
+                user=user,
+                token_name=token_name,
+                token_value=token_secret,
+                port=int(p.get("port", 8006)),
+                verify_ssl=bool(p.get("verify_ssl", True)),
+                timeout=api_timeout,
+            )
+        except SystemExit as exc:
+            raise RuntimeError(
+                "Proxmox client failed to load (proxmoxer HTTPS backend). "
+                "Install the `requests` package in the image/venv."
+            ) from exc
     user = (p.get("user") or "").strip()
     password = (p.get("password") or "").strip()
     if not user or not password:
         raise ValueError("Proxmox: set api_token_id/api_token_secret or user/password in config.yaml")
-    return ProxmoxAPI(
-        host=p["host"],
-        user=user,
-        password=password,
-        port=int(p.get("port", 8006)),
-        verify_ssl=bool(p.get("verify_ssl", True)),
-        timeout=api_timeout,
-    )
+    try:
+        return ProxmoxAPI(
+            host=p["host"],
+            user=user,
+            password=password,
+            port=int(p.get("port", 8006)),
+            verify_ssl=bool(p.get("verify_ssl", True)),
+            timeout=api_timeout,
+        )
+    except SystemExit as exc:
+        raise RuntimeError(
+            "Proxmox client failed to load (proxmoxer HTTPS backend). "
+            "Install the `requests` package in the image/venv."
+        ) from exc
 
 
 def connect_proxmox_args_helper(cfg: dict[str, Any]) -> ProxmoxAPI | None:

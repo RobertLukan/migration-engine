@@ -1,6 +1,6 @@
 # Migration Engine
 
-VMware → Proxmox migration orchestrator (**v2.2.1**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, then first-boot guest-agent checks.
+VMware → Proxmox migration orchestrator (**v2.2.2**): FastAPI dashboard and API plus a Redis-backed **worker** that runs the migration pipeline — disk import directly to the SCSI boot disk, then first-boot guest-agent checks.
 
 ## Intended use
 

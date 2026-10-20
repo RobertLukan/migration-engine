@@ -571,7 +571,7 @@ if not _session_secret:
         "config.yaml must define ui.session_secret (random string) and ui.password (dashboard password)"
     )
 
-app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.2.1")
+app = FastAPI(title="VMware → Proxmox migration orchestrator", version="2.2.2")
 app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret,

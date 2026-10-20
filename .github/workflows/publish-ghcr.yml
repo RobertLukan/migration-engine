@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Git ref to build (tag recommended, e.g. v2.2.1)
+        description: Git ref to build (tag recommended, e.g. v2.2.2)
         required: true
-        default: v2.2.1
+        default: v2.2.2
 
 permissions:
   contents: read
